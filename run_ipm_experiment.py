@@ -7,6 +7,7 @@ import numpy as np
 import random
 import argparse
 import itertools
+import time
 from scipy.stats import spearmanr, mannwhitneyu, wilcoxon, ttest_rel
 from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.sparse import coo_matrix, diags
@@ -759,6 +760,9 @@ def main():
     parser.add_argument("--emb_path", type=str, default="patent_embeddings.pt")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"],
                         help="Compute device. 'auto' = cuda>mps>cpu. Use 'cpu' if sparse ops are unsupported on mps.")
+    parser.add_argument("--demand_sample", type=int, default=2000,
+                        help="Demand Score (E19) is a slow per-query citation-BFS and near-degenerate on KIPRIS. "
+                             "Evaluate it on a random sample of this many test queries (<=0 = all). Set 0 to use all.")
     args = parser.parse_args()
     os.makedirs(args.artifact_dir, exist_ok=True)
     
@@ -1070,9 +1074,43 @@ def main():
     beta_ndcg_seeds = {(disp, b): [] for disp, _ in BACKBONES for b in betas}
     alpha_ndcg_seeds = {(disp, a): [] for disp, _ in BACKBONES for a in alphas}
     
+    # MostPop-IPC (NEW-9) is seed-invariant (pure function of fixed candidates + train counts),
+    # so compute it ONCE here instead of re-running its per-query loop every seed.
+    print("Precomputing IPC-conditional MostPop (seed-invariant)...", flush=True)
+    _t = time.time()
+    mostpop_ipc_cached = evaluate_mostpop_ipc(test_queries_per_seed[SEEDS[0]], ipc_company_count, train_pop)
+    print(f"  MostPop-IPC precomputed in {time.time()-_t:.1f}s", flush=True)
+
+    # Demand Score (E19) is ALSO seed-invariant (no learned params, fixed candidates), and its
+    # per-query citation-BFS loop is the single most expensive non-GNN step. Compute it ONCE.
+    _demand_queries = test_queries_per_seed[SEEDS[0]]
+    if args.demand_sample and args.demand_sample > 0 and args.demand_sample < len(_demand_queries):
+        _ds_rng = np.random.default_rng(SEEDS[0])
+        _sel = _ds_rng.choice(len(_demand_queries), size=args.demand_sample, replace=False)
+        _demand_queries = [_demand_queries[i] for i in _sel]
+        print(f"Precomputing Demand Score on a {len(_demand_queries)}-query sample (of "
+              f"{len(test_queries_per_seed[SEEDS[0]])}; slow citation BFS)...", flush=True)
+    else:
+        print("Precomputing Demand Score original/revised on ALL queries (seed-invariant, slow citation BFS)...", flush=True)
+    _t = time.time()
+    _ranks_demand_orig, _ranks_demand_rev = [], []
+    for q in _demand_queries:
+        ro, _ = demand_score_rank(q[0], q[1], q[3], "original", train_pop, company_last_active,
+                                  patent_ipc, patent_indegree, ipc4_mean_cit, ipc4_global_mean,
+                                  power_threshold, STRATEGIC_IPC4, company_patents, cited_by, all_patents_list)
+        rr, _ = demand_score_rank(q[0], q[1], q[3], "revised", train_pop, company_last_active,
+                                  patent_ipc, patent_indegree, ipc4_mean_cit, ipc4_global_mean,
+                                  power_threshold, STRATEGIC_IPC4, company_patents, cited_by, all_patents_list)
+        _ranks_demand_orig.append(ro)
+        _ranks_demand_rev.append(rr)
+    demand_orig_ndcg_once = aggregate(_ranks_demand_orig)["ndcg@10"]
+    demand_rev_ndcg_once = aggregate(_ranks_demand_rev)["ndcg@10"]
+    print(f"  Demand Score precomputed in {time.time()-_t:.1f}s", flush=True)
+
     # Run Seeds
     for seed in SEEDS:
-        print(f"\n--- Running Seed {seed} ---")
+        seed_t0 = time.time()
+        print(f"\n--- Running Seed {seed} ---", flush=True)
         torch.manual_seed(seed)
         np.random.seed(seed)
         queries = test_queries_per_seed[seed]
@@ -1105,13 +1143,14 @@ def main():
             spearman_by_model[name].append(float(val if not np.isnan(val) else 0.0))
             ranks_by_model_by_seed[name][seed] = ranks
             scores_by_model_by_seed[name][seed] = scores_all
+            print(f"    [seed {seed}] {name:22s} done  (+{time.time()-seed_t0:6.1f}s)", flush=True)
             
         # 1. MostPop Baseline (global popularity)
         ranks_mp, aucs_mp, aps_mp, scores_mp, pop_mp = evaluate_mostpop(test_cand_t, train_pop_t)
         record_model("MostPop", ranks_mp, aucs_mp, aps_mp, scores_mp, pop_mp)
 
-        # 1b. IPC-conditional MostPop (NEW-9): popularity WITHIN the query's ipc4
-        record_model("MostPop-IPC", *evaluate_mostpop_ipc(queries, ipc_company_count, train_pop))
+        # 1b. IPC-conditional MostPop (NEW-9): popularity WITHIN the query's ipc4 (precomputed once)
+        record_model("MostPop-IPC", *mostpop_ipc_cached)
         
         # 2. Recency Baseline
         ranks_rec, aucs_rec, aps_rec, scores_rec, pop_rec = evaluate_recency(test_cand_t, company_last_active_t, train_pop_t)
@@ -1217,35 +1256,9 @@ def main():
             record_model(f"{disp}+Debias+IPS", *evaluate_gnn(m_db, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=1.0))
             record_model(f"{disp}+Time+IPS", *evaluate_gnn(m_t, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=1.0, time_enc=time_enc))
 
-        # 13. Demand Score Original & Revised
-        ranks_demand_orig = []
-        ranks_demand_rev = []
-        
-        for q in queries:
-            p_idx = q[0]
-            c_pos_idx = q[1]
-            cand_list = q[3]
-            
-            rank_orig, _ = demand_score_rank(
-                p_idx, c_pos_idx, cand_list, "original",
-                train_pop, company_last_active, patent_ipc,
-                patent_indegree, ipc4_mean_cit, ipc4_global_mean,
-                power_threshold, STRATEGIC_IPC4,
-                company_patents, cited_by, all_patents_list
-            )
-            ranks_demand_orig.append(rank_orig)
-            
-            rank_rev, _ = demand_score_rank(
-                p_idx, c_pos_idx, cand_list, "revised",
-                train_pop, company_last_active, patent_ipc,
-                patent_indegree, ipc4_mean_cit, ipc4_global_mean,
-                power_threshold, STRATEGIC_IPC4,
-                company_patents, cited_by, all_patents_list
-            )
-            ranks_demand_rev.append(rank_rev)
-            
-        demand_orig_ndcg_seeds.append(aggregate(ranks_demand_orig)["ndcg@10"])
-        demand_rev_ndcg_seeds.append(aggregate(ranks_demand_rev)["ndcg@10"])
+        # 13. Demand Score Original & Revised (precomputed once above; seed-invariant)
+        demand_orig_ndcg_seeds.append(demand_orig_ndcg_once)
+        demand_rev_ndcg_seeds.append(demand_rev_ndcg_once)
         
         # Mitigation hyperparameter sweeps on BOTH backbones (NEW-8)
         for disp, gtype in BACKBONES:
@@ -1260,6 +1273,8 @@ def main():
                 train_gnn(m_tmp, data, train_edge_index, train_pop, debias_alpha=alpha, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
                 ranks_a, *_ = evaluate_gnn(m_tmp, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
                 alpha_ndcg_seeds[(disp, alpha)].append(aggregate(ranks_a)["ndcg@10"])
+        print(f"    [seed {seed}] sweeps (beta/alpha x backbone) done  (+{time.time()-seed_t0:6.1f}s)", flush=True)
+        print(f"--- Seed {seed} complete in {time.time()-seed_t0:.1f}s ---", flush=True)
             
     print("\nProcessing results and generating diagnostics...")
     
