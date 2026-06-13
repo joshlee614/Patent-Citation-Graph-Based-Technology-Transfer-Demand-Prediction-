@@ -657,7 +657,7 @@ def compute_inversion_rate(queries, scores_all, train_pop, pop_thr_q=0.9):
     total_count = is_hard_neg.sum()
     return inversion_count / (total_count + 1e-10)
 
-def citation_depth(target_patent_idx, company_patent_idxs, cited_by, max_depth=5, max_nodes=2000):
+def citation_depth(target_patent_idx, company_patent_idxs, cited_by, max_depth=5, max_nodes=800):
     """
     Shortest path (in citation hops) from target_patent_idx
     back to any patent owned by the company.
@@ -768,9 +768,10 @@ def main():
     parser.add_argument("--emb_path", type=str, default="patent_embeddings.pt")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"],
                         help="Compute device. 'auto' = cuda>mps>cpu. Use 'cpu' if sparse ops are unsupported on mps.")
-    parser.add_argument("--demand_sample", type=int, default=2000,
+    parser.add_argument("--demand_sample", type=int, default=200,
                         help="Demand Score (E19) is a slow per-query citation-BFS and near-degenerate on KIPRIS. "
-                             "Evaluate it on a random sample of this many test queries (<=0 = all). Set 0 to use all.")
+                             "Evaluate it on a random sample of this many test queries. Keep it small (100-300); "
+                             "large values make E19 dominate runtime. Negative = use ALL (very slow, not recommended).")
     args = parser.parse_args()
     os.makedirs(args.artifact_dir, exist_ok=True)
     
