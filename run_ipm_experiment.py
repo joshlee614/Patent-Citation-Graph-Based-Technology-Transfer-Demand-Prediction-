@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import random
 import argparse
+import itertools
 from scipy.stats import spearmanr, mannwhitneyu, wilcoxon, ttest_rel
 from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.sparse import coo_matrix, diags
@@ -217,6 +218,85 @@ def aggregate(rank_list, ks=KS):
     keys = metrics[0].keys()
     return {k: float(np.mean([m[k] for m in metrics])) for k in keys}
 
+def aggregate_with_n(rank_list, ks=KS):
+    """aggregate() but tolerant of empty input and carrying the query count n."""
+    if len(rank_list) == 0:
+        out = {f"hits@{k}": 0.0 for k in ks}
+        out.update({f"ndcg@{k}": 0.0 for k in ks})
+        out["mrr"] = 0.0
+        out["map"] = 0.0
+        out["n"] = 0
+        return out
+    out = aggregate(rank_list, ks)
+    out["n"] = len(rank_list)
+    return out
+
+def bootstrap_ci_ndcg(rank_list, n_boot=1000, seed=0):
+    """Percentile (2.5/97.5) bootstrap CI over the PER-QUERY ranks (NEW-12).
+    Resamples test queries with replacement; captures query-sampling variance that
+    the seed-level std does not. Returns {metric: (mean, lo, hi)}."""
+    r = np.asarray(rank_list, dtype=float)
+    n = len(r)
+    if n == 0:
+        return {m: (0.0, 0.0, 0.0) for m in ("ndcg@10", "hits@10", "mrr")}
+    rng = np.random.default_rng(seed)
+    boot = {"ndcg@10": [], "hits@10": [], "mrr": []}
+    for _ in range(n_boot):
+        rr = r[rng.integers(0, n, size=n)]
+        boot["ndcg@10"].append(float(np.where(rr <= 10, 1.0 / np.log2(rr + 1.0), 0.0).mean()))
+        boot["hits@10"].append(float((rr <= 10).mean()))
+        boot["mrr"].append(float((1.0 / rr).mean()))
+    return {m: (float(np.mean(v)), float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5)))
+            for m, v in boot.items()}
+
+def evaluate_mostpop_ipc(queries, ipc_company_count, train_pop):
+    """IPC-conditional MostPop (NEW-9): score each candidate by its train-transfer
+    count WITHIN the query's own ipc4 (a stronger popularity skyline than global MostPop).
+    Returns the same 5-tuple shape as the other evaluators."""
+    ranks, aucs, aps, scores_all, pops_all = [], [], [], [], []
+    for q in queries:
+        c_pos_idx, ipc4, cand = q[1], q[2], q[3]
+        counts = ipc_company_count.get(ipc4, {})
+        s = np.array([counts.get(int(c), 0) for c in cand], dtype=float)
+        pos, neg = s[0], s[1:]
+        rank = int((neg > pos).sum()) + 1
+        if len(neg) > 0:
+            auc = float(((pos > neg).astype(float) + 0.5 * (pos == neg).astype(float)).mean())
+        else:
+            auc = 0.5
+        ranks.append(rank)
+        aucs.append(auc)
+        aps.append(1.0 / rank)
+        scores_all.append(s)
+        pops_all.append(train_pop[np.asarray(cand, dtype=int)])
+    return ranks, aucs, aps, np.array(scores_all), np.array(pops_all)
+
+def classify_failures(queries, rank_list, scores_all, train_pop, pop_thr_q=0.9):
+    """Error-source decomposition (NEW-4). For each FAILED query (rank>1) attribute it to:
+      - popular_hardneg : a historically popular (>=90th pct) hard negative outscored the positive
+      - rare_new_positive : the true target company is rare/new (train_pop<=1)
+      - semantic_residual : neither of the above (model just ranked it wrong)
+    Priority: popularity mechanism first (the paper's thesis), then cold-start, then residual."""
+    thr = np.quantile(train_pop, pop_thr_q) if len(train_pop) > 0 else 0.0
+    buckets = {"popular_hardneg": 0, "rare_new_positive": 0, "semantic_residual": 0}
+    n_fail = 0
+    for i, q in enumerate(queries):
+        if rank_list[i] <= 1:
+            continue
+        n_fail += 1
+        c_pos, cand = q[1], q[3]
+        srow = scores_all[i]
+        pos_score, neg_scores = srow[0], srow[1:]
+        neg_pop = train_pop[np.asarray(cand[1:], dtype=int)]
+        beaten_by_popular = bool(np.any((neg_scores > pos_score) & (neg_pop >= thr)))
+        if beaten_by_popular:
+            buckets["popular_hardneg"] += 1
+        elif train_pop[c_pos] <= 1:
+            buckets["rare_new_positive"] += 1
+        else:
+            buckets["semantic_residual"] += 1
+    return buckets, n_fail
+
 # Debiased neg sampling
 def sample_neg_debiased(n_samples, train_pop, alpha, rng, num_companies):
     prob = (train_pop + 1.0) ** alpha
@@ -309,13 +389,13 @@ def compute_ndcg_from_embeddings(hp, hc, p_t, cand_t, batch_size=10000):
 
 # GNN early stopping val evaluator (vectorized & batched)
 @torch.no_grad()
-def compute_val_ndcg(model, data, val_p_t, val_cand_t, device):
+def compute_val_ndcg(model, data, val_p_t, val_cand_t, device, time_enc=None):
     model.eval()
     x_dict = {
         'patent': data['patent'].x,
         'company': data['company'].x
     }
-    node_embs = model(x_dict, data.edge_index_dict)
+    node_embs = model(x_dict, data.edge_index_dict, time_enc=time_enc)
     hp = node_embs['patent']
     hc = node_embs['company']
     return compute_ndcg_from_embeddings(hp, hc, val_p_t, val_cand_t)
@@ -386,9 +466,11 @@ def get_train_neg_edges(train_edge_index, train_pop, alpha, seed, num_companies)
     return torch.stack([neg_c, train_edge_index[1].cpu()], dim=0)
 
 def compute_loss_logq(pos_score, neg_score, pos_c, neg_c, train_pop, logq_alpha):
-    q = (train_pop + 1.0) ** logq_alpha
+    # q(c) ~ (popularity+1)^alpha; subtract log q from logits (sampled-softmax / logQ correction).
+    # train_pop is a numpy array here; build the tensor explicitly to avoid copy-construct warnings.
+    q = (np.asarray(train_pop, dtype=np.float64) + 1.0) ** logq_alpha
     q = q / q.sum()
-    log_q = torch.log(torch.tensor(q, dtype=torch.float32, device=pos_score.device) + 1e-10)
+    log_q = torch.log(torch.as_tensor(q, dtype=torch.float32, device=pos_score.device) + 1e-10)
     
     pos_score_corr = pos_score - log_q[pos_c]
     neg_score_corr = neg_score - log_q[neg_c]
@@ -397,7 +479,7 @@ def compute_loss_logq(pos_score, neg_score, pos_c, neg_c, train_pop, logq_alpha)
     labels = torch.cat([torch.ones(len(pos_score)), torch.zeros(len(neg_score))]).to(pos_score.device)
     return F.binary_cross_entropy_with_logits(scores, labels)
 
-def train_gnn(model, data, train_edge_index, train_pop, debias_alpha, logq_alpha, max_epochs, lr, device, seed, num_companies, val_queries=None, patience=5):
+def train_gnn(model, data, train_edge_index, train_pop, debias_alpha, logq_alpha, max_epochs, lr, device, seed, num_companies, val_queries=None, patience=5, time_enc=None):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = torch.nn.BCEWithLogitsLoss()
     model.to(device)
@@ -423,14 +505,14 @@ def train_gnn(model, data, train_edge_index, train_pop, debias_alpha, logq_alpha
             'patent': data['patent'].x,
             'company': data['company'].x
         }
-        node_embs = model(x_dict, data.edge_index_dict)
+        node_embs = model(x_dict, data.edge_index_dict, time_enc=time_enc)
         hp = node_embs['patent']
         hc = node_embs['company']
-        
+
         src_c = train_label_index[0]
         dst_p = train_label_index[1]
         out = (hc[src_c] * hp[dst_p]).sum(-1)
-        
+
         if logq_alpha > 0.0:
             pos_score = out[:train_edge_index.size(1)]
             neg_score = out[train_edge_index.size(1):]
@@ -445,7 +527,7 @@ def train_gnn(model, data, train_edge_index, train_pop, debias_alpha, logq_alpha
         
         # Validation evaluation & Early stopping check
         if val_p_t is not None:
-            val_ndcg = compute_val_ndcg(model, data, val_p_t, val_cand_t, device)
+            val_ndcg = compute_val_ndcg(model, data, val_p_t, val_cand_t, device, time_enc=time_enc)
             if val_ndcg > best_val_ndcg:
                 best_val_ndcg = val_ndcg
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -481,9 +563,13 @@ def evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta=0.0
             scores = scores - pen
             
         ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
-        aucs = (scores[:, 0:1] > scores[:, 1:]).float().mean(dim=-1)
-        aps = 1.0 / ranks.float()
-        
+        # True rank-AUC for a single positive: P(pos>neg) + 0.5*P(pos==neg), averaged
+        # over the candidate negatives. Ties contribute 0.5 (matches sklearn roc_auc_score),
+        # unlike the previous strict-'>' version which mislabeled a tie-pessimistic statistic as AUC.
+        aucs = ((scores[:, 0:1] > scores[:, 1:]).float()
+                + 0.5 * (scores[:, 0:1] == scores[:, 1:]).float()).mean(dim=-1)
+        aps = 1.0 / ranks.float()  # AP == MRR for single-positive (not displayed; see Table 4 note)
+
         all_ranks.extend(ranks.cpu().numpy().tolist())
         all_aucs.extend(aucs.cpu().numpy().tolist())
         all_aps.extend(aps.cpu().numpy().tolist())
@@ -494,13 +580,13 @@ def evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta=0.0
 
 # Evaluation wrappers (vectorized & batched)
 @torch.no_grad()
-def evaluate_gnn(model, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0):
+def evaluate_gnn(model, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0, time_enc=None):
     model.eval()
     x_dict = {
         'patent': data['patent'].x,
         'company': data['company'].x
     }
-    node_embs = model(x_dict, data.edge_index_dict)
+    node_embs = model(x_dict, data.edge_index_dict, time_enc=time_enc)
     hp = node_embs['patent']
     hc = node_embs['company']
     return evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta)
@@ -517,7 +603,8 @@ def evaluate_cf_model(model, norm_adj, test_p_t, test_cand_t, device, train_pop_
 def evaluate_mostpop(test_cand_t, train_pop_t):
     scores = train_pop_t[test_cand_t].float()
     ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
-    aucs = (scores[:, 0:1] > scores[:, 1:]).float().mean(dim=-1)
+    aucs = ((scores[:, 0:1] > scores[:, 1:]).float()
+            + 0.5 * (scores[:, 0:1] == scores[:, 1:]).float()).mean(dim=-1)
     aps = 1.0 / ranks.float()
     return (
         ranks.cpu().numpy().tolist(),
@@ -530,7 +617,8 @@ def evaluate_mostpop(test_cand_t, train_pop_t):
 def evaluate_recency(test_cand_t, company_last_active_t, train_pop_t):
     scores = company_last_active_t[test_cand_t].float()
     ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
-    aucs = (scores[:, 0:1] > scores[:, 1:]).float().mean(dim=-1)
+    aucs = ((scores[:, 0:1] > scores[:, 1:]).float()
+            + 0.5 * (scores[:, 0:1] == scores[:, 1:]).float()).mean(dim=-1)
     aps = 1.0 / ranks.float()
     return (
         ranks.cpu().numpy().tolist(),
@@ -666,26 +754,34 @@ def main():
     parser.add_argument("--seeds", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--n_neg", type=int, default=None)
-    parser.add_argument("--artifact_dir", type=str, default="/Users/isang-won/.gemini/antigravity-ide/brain/f07284b4-b329-432d-aea6-12b660432bcc")
+    parser.add_argument("--artifact_dir", type=str, default="./ipm_artifacts")
+    parser.add_argument("--data_dir", type=str, default="kipris-csv")
+    parser.add_argument("--emb_path", type=str, default="patent_embeddings.pt")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"],
+                        help="Compute device. 'auto' = cuda>mps>cpu. Use 'cpu' if sparse ops are unsupported on mps.")
     args = parser.parse_args()
+    os.makedirs(args.artifact_dir, exist_ok=True)
     
     if args.mode == "fast":
         num_seeds = args.seeds if args.seeds is not None else 2
         max_epochs = args.epochs if args.epochs is not None else 5
         n_neg = args.n_neg if args.n_neg is not None else 20
-        print("Running in FAST mode (Subsampled dataset, 2 seeds, 5 epochs, 20 hard negatives)...")
+        print(f"Running in FAST mode (Subsampled dataset, {num_seeds} seeds, {max_epochs} epochs, {n_neg} hard negatives)...")
     else:
         num_seeds = args.seeds if args.seeds is not None else 10
         max_epochs = args.epochs if args.epochs is not None else 50
         n_neg = args.n_neg if args.n_neg is not None else 100
-        print("Running in FULL mode (Full dataset, 10 seeds, 50 epochs, 100 hard negatives)...")
+        print(f"Running in FULL mode (Full dataset, {num_seeds} seeds, {max_epochs} epochs, {n_neg} hard negatives)...")
         
     SEEDS = list(range(num_seeds))
-    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    if args.device == "auto":
+        device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    else:
+        device = torch.device(args.device)
     print(f"Device: {device}")
-    
+
     # Load Data
-    data_dir = 'kipris-csv'
+    data_dir = args.data_dir
     print("Loading datasets...")
     patents_df = pd.read_csv(os.path.join(data_dir, 'patents.csv'), usecols=['patApplicationNumber', 'patIpcNumber'], low_memory=False)
     transfers_df = pd.read_csv(os.path.join(data_dir, 'transfers.csv'), usecols=['trApplicationNumber', 'trCorrelatorName', 'trRegistrationDate'], low_memory=False)
@@ -729,7 +825,7 @@ def main():
     original_patent_ids = original_patents_df['patApplicationNumber'].unique()
     orig_patent2idx = {pid: i for i, pid in enumerate(original_patent_ids)}
     
-    full_patent_x = torch.load('patent_embeddings.pt', map_location='cpu')
+    full_patent_x = torch.load(args.emb_path, map_location='cpu')
     patent_x_list = [full_patent_x[orig_patent2idx[pid]] for pid in patent_ids]
     patent_x = torch.stack(patent_x_list)
     del full_patent_x
@@ -754,8 +850,11 @@ def main():
     
     # Build transfer sets
     train_transfer_set = set(zip(train_df['trApplicationNumber'].map(patent2idx), train_df['trCorrelatorName'].map(company2idx)))
-    
+    # Patents that appear as a transfer target in TRAIN (patent-side "seen" flag for NEW-3 cold-start)
+    train_patent_set = {p for (p, c) in train_transfer_set}
+
     ipc_company_index = {}
+    ipc_company_count = {}   # NEW-9: per-IPC per-company train transfer COUNT (IPC-conditional MostPop)
     train_apps = train_df['trApplicationNumber'].to_numpy()
     train_corrs = train_df['trCorrelatorName'].to_numpy()
     for i in range(len(train_df)):
@@ -763,7 +862,9 @@ def main():
         ipc4 = patent_ipc.get(train_apps[i], 'UNKNOWN')
         if ipc4 not in ipc_company_index:
             ipc_company_index[ipc4] = set()
+            ipc_company_count[ipc4] = {}
         ipc_company_index[ipc4].add(c)
+        ipc_company_count[ipc4][c] = ipc_company_count[ipc4].get(c, 0) + 1
         
     # Popularity & Recency features
     train_pop = np.zeros(NUM_COMPANIES)
@@ -854,13 +955,21 @@ def main():
         
     test_apps = test_df['trApplicationNumber'].to_numpy()
     test_corrs = test_df['trCorrelatorName'].to_numpy()
+    # NEW-1: capture each test transfer's horizon (months after the train cutoff) BEFORE
+    # test_df is deleted, aligned to test_list/queries order.
+    train_cutoff_date = train_df['trRegistrationDate'].max() if len(train_df) > 0 else pd.Timestamp('1980-01-01')
+    test_dates = pd.to_datetime(test_df['trRegistrationDate']).to_numpy()
     test_list = []
+    test_horizon = []   # months after train cutoff, parallel to test_list
     for i in range(len(test_df)):
         p_app = test_apps[i]
         p = patent2idx[p_app]
         c_pos = company2idx[test_corrs[i]]
         ipc4 = patent_ipc.get(p_app, 'UNKNOWN')
         test_list.append((p, c_pos, ipc4))
+        months = (test_dates[i] - np.datetime64(train_cutoff_date)) / np.timedelta64(1, 'D') / 30.44
+        test_horizon.append(float(max(months, 0.0)))
+    test_horizon = np.array(test_horizon)
         
     rng = np.random.default_rng(SEEDS[0])
     
@@ -925,8 +1034,15 @@ def main():
     del original_patents_df
     gc.collect()
     
-    # Dict to collect final results (excluding logQ and Demand models)
-    models = ["MostPop", "Recency", "SVD", "MLP", "LightGCN", "NGCF", "GraphSAGE", "GAT", "GAT+DropEdge", "GAT+Time", "GraphSAGE+Debias", "GraphSAGE+IPS"]
+    # Baselines + a SYMMETRIC (backbone x mitigation) grid so every mitigation is
+    # applied to BOTH GraphSAGE and GAT (NEW-6), and logQ is actually trained/reported (B6).
+    BASE_MODELS = ["MostPop", "MostPop-IPC", "Recency", "SVD", "MLP", "LightGCN", "NGCF", "GraphSAGE", "GAT"]
+    BACKBONES = [("GraphSAGE", "SAGE"), ("GAT", "GAT")]   # (display name, FullModel gnn_type)
+    MITIGATIONS = ["Debias", "logQ", "DropEdge", "Time", "IPS"]
+    COMBOS = ["Debias+IPS", "Time+IPS"]                   # stacked mitigations (NEW-7)
+    mitigation_models = [f"{disp}+{m}" for disp, _ in BACKBONES for m in MITIGATIONS]
+    combo_models = [f"{disp}+{c}" for disp, _ in BACKBONES for c in COMBOS]
+    models = BASE_MODELS + mitigation_models + combo_models
     metrics_by_model = {m: [] for m in models}
     
     # Collections for diagnostic correlation (all models)
@@ -947,11 +1063,12 @@ def main():
     gat_attention_weights = None
     gat_is_hub_edge = None
     
-    # IPS and Alpha sweeps
+    # IPS (beta) and Debias (alpha) sensitivity sweeps, run on BOTH backbones (NEW-8).
+    # Keyed by (backbone display name, hyperparameter value).
     betas = [0.0, 0.5, 1.0, 2.0, 4.0]
-    beta_ndcg_seeds = {b: [] for b in betas}
-    alphas = [0.0, 0.5, 0.75, 1.0]
-    alpha_ndcg_seeds = {a: [] for a in alphas}
+    alphas = [0.0, 0.25, 0.5, 0.75, 1.0]   # NEW-8: added 0.25 grid point
+    beta_ndcg_seeds = {(disp, b): [] for disp, _ in BACKBONES for b in betas}
+    alpha_ndcg_seeds = {(disp, a): [] for disp, _ in BACKBONES for a in alphas}
     
     # Run Seeds
     for seed in SEEDS:
@@ -989,9 +1106,12 @@ def main():
             ranks_by_model_by_seed[name][seed] = ranks
             scores_by_model_by_seed[name][seed] = scores_all
             
-        # 1. MostPop Baseline
+        # 1. MostPop Baseline (global popularity)
         ranks_mp, aucs_mp, aps_mp, scores_mp, pop_mp = evaluate_mostpop(test_cand_t, train_pop_t)
         record_model("MostPop", ranks_mp, aucs_mp, aps_mp, scores_mp, pop_mp)
+
+        # 1b. IPC-conditional MostPop (NEW-9): popularity WITHIN the query's ipc4
+        record_model("MostPop-IPC", *evaluate_mostpop_ipc(queries, ipc_company_count, train_pop))
         
         # 2. Recency Baseline
         ranks_rec, aucs_rec, aps_rec, scores_rec, pop_rec = evaluate_recency(test_cand_t, company_last_active_t, train_pop_t)
@@ -1061,84 +1181,42 @@ def main():
             else:
                 strata_metrics_by_seed[stratum].append({"hits@1": 0.0, "hits@3": 0.0, "hits@5": 0.0, "hits@10": 0.0, "mrr": 0.0, "ndcg@10": 0.0})
                 
-        # 9. GAT + DropEdge
-        gat_de = FullModel('GAT', 384, 64, apply_dropedge=True).to(device)
-        train_gnn(gat_de, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
-        ranks_gat_de, aucs_gat_de, aps_gat_de, scores_gat_de, pop_gat_de = evaluate_gnn(gat_de, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
-        record_model("GAT+DropEdge", ranks_gat_de, aucs_gat_de, aps_gat_de, scores_gat_de, pop_gat_de)
-        
-        # 10. GAT + Time Encoding
-        time_gat = FullModel('GAT', 384, 64, use_time=True).to(device)
+        # ── Symmetric mitigation grid (NEW-6 / B6 / NEW-7) ───────────────────────
+        # Each mitigation is applied to BOTH GraphSAGE and GAT under identical seeds
+        # and candidate sets, so the mitigation effect is no longer confounded with
+        # the backbone. logQ is actually trained (B6). Combos stack a re-rank (NEW-7).
         time_enc = get_time_encoding(patent_time_t, dim=16)
-        optimizer = torch.optim.Adam(time_gat.parameters(), lr=0.01)
-        criterion = torch.nn.BCEWithLogitsLoss()
-        
-        best_val_ndcg = -1.0
-        best_state = None
-        patience = 5
-        patience_counter = 0
-        
-        for epoch in range(1, max_epochs + 1):
-            time_gat.train()
-            optimizer.zero_grad()
-            train_neg_edge = get_train_neg_edges(train_edge_index, train_pop, 0.0, seed + epoch, NUM_COMPANIES)
-            train_label_index = torch.cat([train_edge_index, train_neg_edge.to(device)], dim=1)
-            train_label = torch.cat([torch.ones(train_edge_index.size(1)), torch.zeros(train_neg_edge.size(1))]).to(device)
-            
-            x_dict = {
-                'patent': data['patent'].x,
-                'company': data['company'].x
-            }
-            node_embs = time_gat.gnn(x_dict, data.edge_index_dict, time_enc=time_enc)
-            hp = node_embs['patent']
-            hc = node_embs['company']
-            
-            src_c = train_label_index[0]
-            dst_p = train_label_index[1]
-            out = (hc[src_c] * hp[dst_p]).sum(-1)
-            loss = criterion(out, train_label.float())
-            loss.backward()
-            optimizer.step()
-            
-            # Val evaluation
-            time_gat.eval()
-            with torch.no_grad():
-                node_embs_v = time_gat.gnn({'patent': data['patent'].x, 'company': data['company'].x}, data.edge_index_dict, time_enc=time_enc)
-                hp_v = node_embs_v['patent']
-                hc_v = node_embs_v['company']
-                val_ndcg = compute_ndcg_from_embeddings(hp_v, hc_v, val_p_t, val_cand_t)
-                
-            if val_ndcg > best_val_ndcg:
-                best_val_ndcg = val_ndcg
-                best_state = {k: v.cpu().clone() for k, v in time_gat.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    break
-                    
-        if best_state is not None:
-            time_gat.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-            
-        time_gat.eval()
-        with torch.no_grad():
-            node_embs = time_gat.gnn({'patent': data['patent'].x, 'company': data['company'].x}, data.edge_index_dict, time_enc=time_enc)
-            hp = node_embs['patent']
-            hc = node_embs['company']
-            ranks_time_list, aucs_time_list, aps_time_list, scores_time_list, pop_time_list = evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta=0.0)
-            
-        record_model("GAT+Time", ranks_time_list, aucs_time_list, aps_time_list, scores_time_list, pop_time_list)
-        
-        # 11. GraphSAGE + Debias
-        sage_db = FullModel('SAGE', 384, 64).to(device)
-        train_gnn(sage_db, data, train_edge_index, train_pop, debias_alpha=0.75, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
-        ranks_db, aucs_db, aps_db, scores_db, pop_db = evaluate_gnn(sage_db, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
-        record_model("GraphSAGE+Debias", ranks_db, aucs_db, aps_db, scores_db, pop_db)
-        
-        # 12. GraphSAGE + IPS
-        ranks_ips, aucs_ips, aps_ips, scores_ips, pop_ips = evaluate_gnn(sage, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=1.0)
-        record_model("GraphSAGE+IPS", ranks_ips, aucs_ips, aps_ips, scores_ips, pop_ips)
-        
+        base_trained = {"GraphSAGE": sage, "GAT": gat}
+        for disp, gtype in BACKBONES:
+            base_model = base_trained[disp]
+
+            # Debias (retrain with popularity-debiased negatives)
+            m_db = FullModel(gtype, 384, 64).to(device)
+            train_gnn(m_db, data, train_edge_index, train_pop, debias_alpha=0.75, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+            record_model(f"{disp}+Debias", *evaluate_gnn(m_db, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0))
+
+            # logQ (retrain with sampled-softmax / logQ correction)  — B6
+            m_lq = FullModel(gtype, 384, 64).to(device)
+            train_gnn(m_lq, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=1.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+            record_model(f"{disp}+logQ", *evaluate_gnn(m_lq, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0))
+
+            # DropEdge (retrain with citation-edge dropout)
+            m_de = FullModel(gtype, 384, 64, apply_dropedge=True).to(device)
+            train_gnn(m_de, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+            record_model(f"{disp}+DropEdge", *evaluate_gnn(m_de, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0))
+
+            # Time (retrain with sinusoidal time encoding threaded through train_gnn)
+            m_t = FullModel(gtype, 384, 64, use_time=True).to(device)
+            train_gnn(m_t, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5, time_enc=time_enc)
+            record_model(f"{disp}+Time", *evaluate_gnn(m_t, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0, time_enc=time_enc))
+
+            # IPS (test-time popularity-penalty re-rank on the base model, no retrain)
+            record_model(f"{disp}+IPS", *evaluate_gnn(base_model, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=1.0))
+
+            # Combos (NEW-7): stack IPS re-rank on top of an already-trained mitigation
+            record_model(f"{disp}+Debias+IPS", *evaluate_gnn(m_db, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=1.0))
+            record_model(f"{disp}+Time+IPS", *evaluate_gnn(m_t, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=1.0, time_enc=time_enc))
+
         # 13. Demand Score Original & Revised
         ranks_demand_orig = []
         ranks_demand_rev = []
@@ -1169,16 +1247,19 @@ def main():
         demand_orig_ndcg_seeds.append(aggregate(ranks_demand_orig)["ndcg@10"])
         demand_rev_ndcg_seeds.append(aggregate(ranks_demand_rev)["ndcg@10"])
         
-        # Sweeps
-        for beta in betas:
-            ranks_b, _, _, _, _ = evaluate_gnn(sage, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=beta)
-            beta_ndcg_seeds[beta].append(aggregate(ranks_b)["ndcg@10"])
-            
-        for alpha in alphas:
-            sage_db_temp = FullModel('SAGE', 384, 64).to(device)
-            train_gnn(sage_db_temp, data, train_edge_index, train_pop, debias_alpha=alpha, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
-            ranks_a, _, _, _, _ = evaluate_gnn(sage_db_temp, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
-            alpha_ndcg_seeds[alpha].append(aggregate(ranks_a)["ndcg@10"])
+        # Mitigation hyperparameter sweeps on BOTH backbones (NEW-8)
+        for disp, gtype in BACKBONES:
+            base_model = base_trained[disp]
+            # IPS beta sweep (test-time re-rank on the trained base model, no retrain)
+            for beta in betas:
+                ranks_b, *_ = evaluate_gnn(base_model, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=beta)
+                beta_ndcg_seeds[(disp, beta)].append(aggregate(ranks_b)["ndcg@10"])
+            # Debias alpha sweep (retrain per alpha)
+            for alpha in alphas:
+                m_tmp = FullModel(gtype, 384, 64).to(device)
+                train_gnn(m_tmp, data, train_edge_index, train_pop, debias_alpha=alpha, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+                ranks_a, *_ = evaluate_gnn(m_tmp, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+                alpha_ndcg_seeds[(disp, alpha)].append(aggregate(ranks_a)["ndcg@10"])
             
     print("\nProcessing results and generating diagnostics...")
     
@@ -1191,21 +1272,32 @@ def main():
             summary_results[m][f"{k}_mean"] = float(np.mean(vals))
             summary_results[m][f"{k}_std"] = float(np.std(vals))
             
-    # 2. Pairwise Wilcoxon and paired t-test on the 7 specified comparison pairs
-    comparisons = [
-        ('GAT',            'GraphSAGE'),
-        ('GAT+DropEdge',   'GAT'),
-        ('GAT',            'MostPop'),
-        ('GAT',            'SVD'),
-        ('GraphSAGE+Debias', 'GraphSAGE'),
-        ('GraphSAGE+IPS',  'GraphSAGE'),
-        ('GAT+Time',       'GAT'),
-    ]
-    
+    # 2. Pairwise Wilcoxon + paired t-test over a PRE-REGISTERED comparison family.
+    # With 22 models the full C(22,2)=231 family is unwieldy; instead we declare an
+    # explicit, scientifically-meaningful family (architecture contrast, each backbone
+    # vs the strongest baselines, and every mitigation/combo vs its own backbone), and
+    # Holm-Bonferroni corrects jointly across exactly this declared family.
+    registered = [("GAT", "GraphSAGE"), ("MostPop-IPC", "MostPop")]   # architecture + skyline contrast
+    for disp, _ in BACKBONES:                                 # backbone vs strong baselines
+        for base in ["MostPop", "MostPop-IPC", "SVD", "NGCF"]:
+            registered.append((disp, base))
+    for disp, _ in BACKBONES:                                 # each mitigation/combo vs its backbone
+        for m in MITIGATIONS + COMBOS:
+            registered.append((f"{disp}+{m}", disp))
+    seen_pairs = set()
+    comparisons = []
+    for a, b in registered:
+        key = frozenset((a, b))
+        if a != b and a in metrics_by_model and b in metrics_by_model and key not in seen_pairs:
+            seen_pairs.add(key)
+            comparisons.append((a, b))
+
     raw_pvals_wilcoxon = []
     raw_pvals_ttest    = []
     comparison_labels  = []
-    
+
+    seeds_sufficient = len(SEEDS) >= 6  # Wilcoxon signed-rank needs >=6 pairs to be meaningful
+
     for (m1, m2) in comparisons:
         s1 = [s["ndcg@10"] for s in metrics_by_model[m1]]
         s2 = [s["ndcg@10"] for s in metrics_by_model[m2]]
@@ -1223,14 +1315,21 @@ def main():
         raw_pvals_wilcoxon.append(p_w)
         raw_pvals_ttest.append(p_t)
         comparison_labels.append(f'{m1} vs {m2}')
-        
+
     _, adj_pvals_w, _, _ = multipletests(raw_pvals_wilcoxon, method='holm')
     _, adj_pvals_t, _, _ = multipletests(raw_pvals_ttest,    method='holm')
-    
-    wilcoxon_table = "| Comparison Pair | Wilcoxon Raw p | Wilcoxon Adjusted p (Holm) | t-Test Raw p | t-Test Adjusted p (Holm) |\n"
+
+    wilcoxon_warning = ""
+    if not seeds_sufficient:
+        wilcoxon_warning = (f"\n> **WARNING**: only {len(SEEDS)} seeds (<6). Wilcoxon signed-rank is "
+                            f"undefined/underpowered, so ALL p-values below are forced to 1.0 and are "
+                            f"NOT real non-results. Re-run with --seeds >= 6 (full mode uses 10).\n")
+    wilcoxon_table = (f"Pre-registered comparison family: **{len(comparisons)}** pairs "
+                      f"(Holm-Bonferroni corrected jointly across exactly these comparisons).\n\n")
+    wilcoxon_table += "| Comparison Pair | Wilcoxon Raw p | Wilcoxon Adjusted p (Holm) | t-Test Raw p | t-Test Adjusted p (Holm) |\n"
     wilcoxon_table += "| :--- | :---: | :---: | :---: | :---: |\n"
-    for idx, label in enumerate(comparison_labels):
-        wilcoxon_table += f"| {label} | {raw_pvals_wilcoxon[idx]:.4e} | {adj_pvals_w[idx]:.4e} | {raw_pvals_ttest[idx]:.4e} | {adj_pvals_t[idx]:.4e} |\n"
+    for idx in range(len(comparison_labels)):
+        wilcoxon_table += f"| {comparison_labels[idx]} | {raw_pvals_wilcoxon[idx]:.4e} | {adj_pvals_w[idx]:.4e} | {raw_pvals_ttest[idx]:.4e} | {adj_pvals_t[idx]:.4e} |\n"
             
     # 3. GAT Attention Weights (D12)
     mw_pval = 1.0
@@ -1290,34 +1389,146 @@ def main():
             "mean": float(np.mean(vals)),
             "std": float(np.std(vals))
         }
-        
-    # Save beta sweep plot
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Low-cost diagnostics: re-bucket the cached ranks/scores (NEW-1/2/3/4/5/12).
+    # No retraining — all of these reuse ranks_by_model_by_seed / scores_by_model_by_seed.
+    # ──────────────────────────────────────────────────────────────────────────
+    KEY_MODELS = [m for m in ["MostPop", "MostPop-IPC", "SVD", "NGCF", "GraphSAGE", "GAT"] if m in models]
+    base_queries = test_queries_per_seed[SEEDS[0]]   # candidate sets are shared across seeds
+    n_test = len(base_queries)
+
+    def subset_ndcg_by_seed(model, mask):
+        """Mean-over-seeds NDCG@10 on the masked subset of test queries; returns (ndcg, n)."""
+        vals = []
+        idxs = np.nonzero(mask)[0]
+        for seed in SEEDS:
+            ranks = ranks_by_model_by_seed[model][seed]
+            sub = [ranks[i] for i in idxs]
+            if sub:
+                vals.append(aggregate(sub)["ndcg@10"])
+        return (float(np.mean(vals)) if vals else 0.0, int(mask.sum()))
+
+    # NEW-1: horizon decay (months after the train cutoff)
+    horizon_bins = [(0, 6), (6, 12), (12, 18), (18, 1e18)]
+    horizon_labels = ["0-6mo", "6-12mo", "12-18mo", "18mo+"]
+    horizon_table = "| Model | " + " | ".join(horizon_labels) + " |\n"
+    horizon_table += "| :--- " + "| :---: " * len(horizon_labels) + "|\n"
+    for m in KEY_MODELS:
+        cells = [f"{subset_ndcg_by_seed(m, (test_horizon >= lo) & (test_horizon < hi))[0]:.4f} "
+                 f"(n={int(((test_horizon >= lo) & (test_horizon < hi)).sum())})" for (lo, hi) in horizon_bins]
+        horizon_table += f"| {m} | " + " | ".join(cells) + " |\n"
     plt.figure(figsize=(6, 4))
-    beta_means = [np.mean(beta_ndcg_seeds[b]) for b in betas]
-    beta_stds = [np.std(beta_ndcg_seeds[b]) for b in betas]
-    plt.errorbar(betas, beta_means, yerr=beta_stds, fmt='-o', color='#34A853', capsize=5)
+    xs = np.arange(len(horizon_labels))
+    for m in KEY_MODELS:
+        ys = [subset_ndcg_by_seed(m, (test_horizon >= lo) & (test_horizon < hi))[0] for (lo, hi) in horizon_bins]
+        plt.plot(xs, ys, '-o', label=m)
+    plt.xticks(xs, horizon_labels)
+    plt.ylabel('NDCG@10')
+    plt.xlabel('Prediction horizon (months after cutoff)')
+    plt.title('Horizon decay')
+    plt.legend(fontsize=7)
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.artifact_dir, 'horizon_decay.png'))
+    plt.close()
+
+    # NEW-2: IPC-section (A-H) decomposition
+    test_sections = np.array([(q[2][0] if (q[2] and q[2] != 'UNKNOWN') else '?') for q in base_queries])
+    sections = sorted(set(test_sections.tolist()))
+    ipc_table = "| Model | " + " | ".join(sections) + " |\n"
+    ipc_table += "| :--- " + "| :---: " * len(sections) + "|\n"
+    for m in KEY_MODELS:
+        cells = [f"{subset_ndcg_by_seed(m, test_sections == s)[0]:.3f}({int((test_sections == s).sum())})"
+                 for s in sections]
+        ipc_table += f"| {m} | " + " | ".join(cells) + " |\n"
+
+    # NEW-3: patent-side cold-start subset (new patent, seen company)
+    patent_seen = np.array([(q[0] in train_patent_set) for q in base_queries])
+    company_seen = np.array([(train_pop[q[1]] > 0) for q in base_queries])
+    frac_patent_unseen = float(np.mean(~patent_seen)) if n_test else 0.0
+    coldp_mask = (~patent_seen) & company_seen
+    coldstart_table = "| Model | All | New-patent & Seen-company | Seen-patent |\n"
+    coldstart_table += "| :--- | :---: | :---: | :---: |\n"
+    for m in KEY_MODELS:
+        all_n = subset_ndcg_by_seed(m, np.ones(n_test, dtype=bool))[0]
+        coldp, coldp_n = subset_ndcg_by_seed(m, coldp_mask)
+        seenp = subset_ndcg_by_seed(m, patent_seen)[0]
+        coldstart_table += f"| {m} | {all_n:.4f} | {coldp:.4f} (n={coldp_n}) | {seenp:.4f} |\n"
+
+    # NEW-4: error-source decomposition (GraphSAGE & GAT)
+    error_table = "| Model | Popular-hardneg | Rare/new positive | Semantic residual | #failures |\n"
+    error_table += "| :--- | :---: | :---: | :---: | :---: |\n"
+    for m in [x for x in ["GraphSAGE", "GAT"] if x in models]:
+        agg = {"popular_hardneg": 0, "rare_new_positive": 0, "semantic_residual": 0}
+        tot = 0
+        for seed in SEEDS:
+            b, nf = classify_failures(test_queries_per_seed[seed], ranks_by_model_by_seed[m][seed],
+                                      scores_by_model_by_seed[m][seed], train_pop)
+            for k in agg:
+                agg[k] += b[k]
+            tot += nf
+        denom = tot if tot > 0 else 1
+        error_table += (f"| {m} | {agg['popular_hardneg']/denom:.1%} | {agg['rare_new_positive']/denom:.1%} "
+                        f"| {agg['semantic_residual']/denom:.1%} | {tot} |\n")
+
+    # NEW-5: qualitative case study (worst-ranked examples for GAT)
+    cs_model = "GAT" if "GAT" in models else KEY_MODELS[-1]
+    sc0 = scores_by_model_by_seed[cs_model][SEEDS[0]]
+    rk0 = ranks_by_model_by_seed[cs_model][SEEDS[0]]
+    case_lines = []
+    for i in sorted(range(n_test), key=lambda j: -rk0[j])[:3]:
+        cand = base_queries[i][3]
+        top5 = np.argsort(-sc0[i])[:5]
+        top5_names = ", ".join(str(company_names[cand[j]]) for j in top5)
+        case_lines.append(f"- Patent `{patent_ids[base_queries[i][0]]}` (IPC {base_queries[i][2]}): "
+                          f"true buyer **{company_names[base_queries[i][1]]}** ranked #{rk0[i]}; "
+                          f"{cs_model} top-5 = [{top5_names}]")
+    case_study_text = "\n".join(case_lines) if case_lines else "(no test queries)"
+
+    # NEW-12: bootstrap CI over test queries (pooled across seeds)
+    boot_table = "| Model | NDCG@10 [95% CI] | Hits@10 [95% CI] | MRR [95% CI] |\n"
+    boot_table += "| :--- | :---: | :---: | :---: |\n"
+    for m in KEY_MODELS:
+        pooled = [r for seed in SEEDS for r in ranks_by_model_by_seed[m][seed]]
+        ci = bootstrap_ci_ndcg(pooled, n_boot=1000, seed=0)
+        fmt = lambda t: f"{t[0]:.4f} [{t[1]:.4f}, {t[2]:.4f}]"
+        boot_table += f"| {m} | {fmt(ci['ndcg@10'])} | {fmt(ci['hits@10'])} | {fmt(ci['mrr'])} |\n"
+
+    # Save beta sweep plot (one curve per backbone)
+    plt.figure(figsize=(6, 4))
+    for disp, _ in BACKBONES:
+        bm = [np.mean(beta_ndcg_seeds[(disp, b)]) for b in betas]
+        bs = [np.std(beta_ndcg_seeds[(disp, b)]) for b in betas]
+        plt.errorbar(betas, bm, yerr=bs, fmt='-o', capsize=5, label=disp)
     plt.xlabel('IPS Penalty Beta')
     plt.ylabel('NDCG@10')
-    plt.title('GraphSAGE Performance vs IPS Penalty Beta\n(Mean ± Std)')
+    plt.title('Performance vs IPS Penalty Beta (Mean ± Std)')
+    plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(args.artifact_dir, 'ips_rerank_sweep.png'))
     plt.close()
-    
-    # Save alpha sweep plot
+
+    # Save alpha sweep plot (one curve per backbone)
     plt.figure(figsize=(6, 4))
-    alpha_means = [np.mean(alpha_ndcg_seeds[a]) for a in alphas]
-    alpha_stds = [np.std(alpha_ndcg_seeds[a]) for a in alphas]
-    plt.errorbar(alphas, alpha_means, yerr=alpha_stds, fmt='-s', color='#F4B400', capsize=5)
+    for disp, _ in BACKBONES:
+        am = [np.mean(alpha_ndcg_seeds[(disp, a)]) for a in alphas]
+        as_ = [np.std(alpha_ndcg_seeds[(disp, a)]) for a in alphas]
+        plt.errorbar(alphas, am, yerr=as_, fmt='-s', capsize=5, label=disp)
     plt.xlabel('Debiased Neg Sampling Alpha')
     plt.ylabel('NDCG@10')
-    plt.title('GraphSAGE Performance vs Debiased Alpha\n(Mean ± Std)')
+    plt.title('Performance vs Debiased Alpha (Mean ± Std)')
+    plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(args.artifact_dir, 'popularity_debiased_sweep.png'))
     plt.close()
-    
-    # Build sweep formatting strings
-    beta_sweep_str = ", ".join([f"{b}: {np.mean(beta_ndcg_seeds[b]):.4f}" for b in betas])
-    alpha_sweep_str = ", ".join([f"{a}: {np.mean(alpha_ndcg_seeds[a]):.4f}" for a in alphas])
+
+    # Build sweep formatting strings (per backbone)
+    beta_sweep_str = " | ".join(
+        f"{disp} {{" + ", ".join(f"{b}: {np.mean(beta_ndcg_seeds[(disp, b)]):.4f}" for b in betas) + "}"
+        for disp, _ in BACKBONES)
+    alpha_sweep_str = " | ".join(
+        f"{disp} {{" + ", ".join(f"{a}: {np.mean(alpha_ndcg_seeds[(disp, a)]):.4f}" for a in alphas) + "}"
+        for disp, _ in BACKBONES)
     
     # Demand Score comparison formatting
     demand_orig_mean = float(np.mean(demand_orig_ndcg_seeds))
@@ -1329,24 +1540,26 @@ def main():
     results_path = os.path.join(args.artifact_dir, "run_ipm_results.md")
     print(f"Saving results to {results_path}...")
     
-    # Build Table 4 Markdown Content (Columns: Hits@1, Hits@3, Hits@5, Hits@10, MRR, NDCG@10, AP)
-    table4 = "| Model Architecture | Negative Sampling | Hits@1 | Hits@3 | Hits@5 | Hits@10 | MRR | NDCG@10 | AP |\n"
+    # Build Table 4 Markdown Content (Columns: Hits@1, Hits@3, Hits@5, Hits@10, MRR, NDCG@10, AUC)
+    table4 = "| Model Architecture | Negative Sampling | Hits@1 | Hits@3 | Hits@5 | Hits@10 | MRR | NDCG@10 | AUC |\n"
     table4 += "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n"
     for m in models:
         ns = "Same-IPC Hard"
-        if m in ["MostPop", "Recency"]:
+        if m in ["MostPop", "MostPop-IPC", "Recency"]:
             ns = "-"
         elif "Debias" in m:
             ns = "Pop-Debiased Hard"
-        
+
         table4 += f"| {m} | {ns} "
-        for k in ["hits@1", "hits@3", "hits@5", "hits@10", "mrr", "ndcg@10", "ap"]:
+        for k in ["hits@1", "hits@3", "hits@5", "hits@10", "mrr", "ndcg@10", "auc"]:
             mean = summary_results[m][f"{k}_mean"]
             std = summary_results[m][f"{k}_std"]
             table4 += f"| {mean:.4f} ± {std:.4f} "
         table4 += "|\n"
-        
-    table4 += "\n*Note: AP equals MRR for single-positive evaluation protocol.*\n"
+
+    table4 += ("\n*Note: AUC is the rank-AUC for a single positive (ties counted as 0.5, "
+               "equal to sklearn roc_auc_score). MAP and AP are omitted because they equal MRR "
+               "exactly under the single-positive protocol.*\n")
         
     # Build Inversion and Spearman table
     diag_table = "| Model | Spearman Correlation (ρ) | Hard-Neg Inversion Rate | \n"
@@ -1383,19 +1596,50 @@ def main():
 - Stratification bar plot saved at `popularity_stratified.png`
 
 ### 2.3 Mitigation Sweeps (B4, B5)
-- IPS Penalty Beta NDCG@10: {{{beta_sweep_str}}}
-- Debiased Negative Sampling Alpha NDCG@10: {{{alpha_sweep_str}}}
-- Plots saved to `ips_rerank_sweep.png` and `popularity_debiased_sweep.png`
+- IPS Penalty Beta NDCG@10 (per backbone): {beta_sweep_str}
+- Debiased Negative Sampling Alpha NDCG@10 (per backbone): {alpha_sweep_str}
+- Plots saved to `ips_rerank_sweep.png` and `popularity_debiased_sweep.png` (one curve per backbone)
 
 ## 3. Pairwise Statistical Significance
 
 Holm-Bonferroni corrected pairwise comparisons for NDCG@10:
-
+{wilcoxon_warning}
 {wilcoxon_table}
 
 ## 4. Demand Score Comparison (E19)
 - **Demand (Original) NDCG@10**: {demand_orig_mean:.4f} ± {demand_orig_std:.4f}
 - **Demand (Revised) NDCG@10**: {demand_rev_mean:.4f} ± {demand_rev_std:.4f}
+
+## 5. Horizon Decay (NEW-1)
+NDCG@10 by prediction horizon (months between train cutoff and the test transfer). Plot: `horizon_decay.png`.
+
+{horizon_table}
+
+## 6. IPC-Section Decomposition (NEW-2)
+NDCG@10 split by IPC section (first letter of ipc4); (n) = #test queries in that section.
+
+{ipc_table}
+
+## 7. Patent-Side Cold-Start (NEW-3)
+- Fraction of test patents UNSEEN in training (patent-side cold start): **{frac_patent_unseen:.2%}**
+- NDCG@10 on the (new-patent, seen-company) subset vs all / seen-patent:
+
+{coldstart_table}
+
+## 8. Error-Source Decomposition (NEW-4)
+Share of FAILED queries (rank>1) attributable to each cause (priority: popularity mechanism > cold-start > residual).
+
+{error_table}
+
+## 9. Qualitative Case Study (NEW-5)
+Worst-ranked {cs_model} examples (seed {SEEDS[0]}): model top-5 companies vs the true buyer.
+
+{case_study_text}
+
+## 10. Bootstrap 95% CIs over Test Queries (NEW-12)
+Percentile CIs from resampling the per-query ranks (captures query-sampling variance that seed-std omits).
+
+{boot_table}
 """
     
     with open(results_path, "w") as f:
