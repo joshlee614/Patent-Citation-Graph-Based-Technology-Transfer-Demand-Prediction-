@@ -657,12 +657,18 @@ def compute_inversion_rate(queries, scores_all, train_pop, pop_thr_q=0.9):
     total_count = is_hard_neg.sum()
     return inversion_count / (total_count + 1e-10)
 
-def citation_depth(target_patent_idx, company_patent_idxs, cited_by, max_depth=5):
+def citation_depth(target_patent_idx, company_patent_idxs, cited_by, max_depth=5, max_nodes=2000):
     """
     Shortest path (in citation hops) from target_patent_idx
     back to any patent owned by the company.
     company_patent_idxs: set of patent indices owned/transferred by the company.
     Returns depth (1 = direct citation), or float('inf') if not reachable.
+
+    max_nodes bounds the BFS frontier: highly-cited "hub" patents can make the
+    depth-5 BFS explode over the 900k-edge citation graph (single queries taking
+    minutes). Once `visited` exceeds max_nodes we give up and return inf. This makes
+    the Demand-Score (E19) cost predictable; E19 is a near-degenerate diagnostic on
+    KIPRIS so this approximation is acceptable.
     """
     if target_patent_idx in company_patent_idxs:
         return 1
@@ -677,6 +683,8 @@ def citation_depth(target_patent_idx, company_patent_idxs, cited_by, max_depth=5
                 if citer not in visited:
                     visited.add(citer)
                     next_frontier.add(citer)
+            if len(visited) > max_nodes:
+                return float('inf')
         frontier = next_frontier
         if not frontier:
             break
@@ -1054,7 +1062,15 @@ def main():
     
     # For inversion rate and Wilcoxon test, we need per-seed query scores and ranks
     ranks_by_model_by_seed = {m: {} for m in models}
-    scores_by_model_by_seed = {m: {} for m in models}
+    # Memory: the per-query SCORE arrays (~220k x 101 floats x 22 models x 10 seeds ~= 19 GB)
+    # are NOT cached across seeds. Each model's score-dependent diagnostics (inversion D15,
+    # error decomposition NEW-4) are consumed INLINE in record_model, and only the GAT seed-0
+    # scores needed for the case study (NEW-5) are retained.
+    inversion_by_model = {m: [] for m in models}
+    error_buckets_by_model = {m: {"popular_hardneg": 0, "rare_new_positive": 0, "semantic_residual": 0}
+                              for m in ["GraphSAGE", "GAT"] if m in models}
+    error_nfail_by_model = {m: 0 for m in ["GraphSAGE", "GAT"] if m in models}
+    case_study_scores0 = {}
     
     # Stratification (Option b)
     strata_metrics_by_seed = {'head': [], 'torso': [], 'tail': []}
@@ -1142,7 +1158,15 @@ def main():
                 
             spearman_by_model[name].append(float(val if not np.isnan(val) else 0.0))
             ranks_by_model_by_seed[name][seed] = ranks
-            scores_by_model_by_seed[name][seed] = scores_all
+            # Consume score-dependent diagnostics now, then let scores_all be garbage-collected.
+            inversion_by_model[name].append(compute_inversion_rate(queries, scores_all, train_pop, pop_thr_q=0.9))
+            if name in error_buckets_by_model:
+                b, nf = classify_failures(queries, ranks, scores_all, train_pop)
+                for k in error_buckets_by_model[name]:
+                    error_buckets_by_model[name][k] += b[k]
+                error_nfail_by_model[name] += nf
+            if name == "GAT" and seed == SEEDS[0]:
+                case_study_scores0["GAT"] = scores_all
             print(f"    [seed {seed}] {name:22s} done  (+{time.time()-seed_t0:6.1f}s)", flush=True)
             
         # 1. MostPop Baseline (global popularity)
@@ -1382,19 +1406,9 @@ def main():
     plt.savefig(os.path.join(args.artifact_dir, 'popularity_stratified.png'))
     plt.close()
     
-    # 5. Inversion rate (D15)
-    inversion_rates = {}
-    for m in models:
-        rates = []
-        for seed in SEEDS:
-            queries = test_queries_per_seed[seed]
-            scores_flat = scores_by_model_by_seed[m][seed]
-            rate = compute_inversion_rate(queries, scores_flat, train_pop, pop_thr_q=0.9)
-            rates.append(rate)
-        inversion_rates[m] = {
-            "mean": float(np.mean(rates)),
-            "std": float(np.std(rates))
-        }
+    # 5. Inversion rate (D15) — accumulated inline per seed in record_model
+    inversion_rates = {m: {"mean": float(np.mean(inversion_by_model[m])),
+                           "std": float(np.std(inversion_by_model[m]))} for m in models}
         
     # 6. Spearman correlation (D13)
     spearman_summary = {}
@@ -1407,7 +1421,7 @@ def main():
 
     # ──────────────────────────────────────────────────────────────────────────
     # Low-cost diagnostics: re-bucket the cached ranks/scores (NEW-1/2/3/4/5/12).
-    # No retraining — all of these reuse ranks_by_model_by_seed / scores_by_model_by_seed.
+    # No retraining — all of these reuse the cached per-query ranks (scores were consumed inline).
     # ──────────────────────────────────────────────────────────────────────────
     KEY_MODELS = [m for m in ["MostPop", "MostPop-IPC", "SVD", "NGCF", "GraphSAGE", "GAT"] if m in models]
     base_queries = test_queries_per_seed[SEEDS[0]]   # candidate sets are shared across seeds
@@ -1473,32 +1487,29 @@ def main():
     # NEW-4: error-source decomposition (GraphSAGE & GAT)
     error_table = "| Model | Popular-hardneg | Rare/new positive | Semantic residual | #failures |\n"
     error_table += "| :--- | :---: | :---: | :---: | :---: |\n"
-    for m in [x for x in ["GraphSAGE", "GAT"] if x in models]:
-        agg = {"popular_hardneg": 0, "rare_new_positive": 0, "semantic_residual": 0}
-        tot = 0
-        for seed in SEEDS:
-            b, nf = classify_failures(test_queries_per_seed[seed], ranks_by_model_by_seed[m][seed],
-                                      scores_by_model_by_seed[m][seed], train_pop)
-            for k in agg:
-                agg[k] += b[k]
-            tot += nf
+    for m in error_buckets_by_model:
+        agg = error_buckets_by_model[m]
+        tot = error_nfail_by_model[m]
         denom = tot if tot > 0 else 1
         error_table += (f"| {m} | {agg['popular_hardneg']/denom:.1%} | {agg['rare_new_positive']/denom:.1%} "
                         f"| {agg['semantic_residual']/denom:.1%} | {tot} |\n")
 
-    # NEW-5: qualitative case study (worst-ranked examples for GAT)
-    cs_model = "GAT" if "GAT" in models else KEY_MODELS[-1]
-    sc0 = scores_by_model_by_seed[cs_model][SEEDS[0]]
-    rk0 = ranks_by_model_by_seed[cs_model][SEEDS[0]]
-    case_lines = []
-    for i in sorted(range(n_test), key=lambda j: -rk0[j])[:3]:
-        cand = base_queries[i][3]
-        top5 = np.argsort(-sc0[i])[:5]
-        top5_names = ", ".join(str(company_names[cand[j]]) for j in top5)
-        case_lines.append(f"- Patent `{patent_ids[base_queries[i][0]]}` (IPC {base_queries[i][2]}): "
-                          f"true buyer **{company_names[base_queries[i][1]]}** ranked #{rk0[i]}; "
-                          f"{cs_model} top-5 = [{top5_names}]")
-    case_study_text = "\n".join(case_lines) if case_lines else "(no test queries)"
+    # NEW-5: qualitative case study (worst-ranked examples for GAT, seed 0 scores retained)
+    cs_model = "GAT"
+    if cs_model in case_study_scores0 and cs_model in ranks_by_model_by_seed:
+        sc0 = case_study_scores0[cs_model]
+        rk0 = ranks_by_model_by_seed[cs_model][SEEDS[0]]
+        case_lines = []
+        for i in sorted(range(n_test), key=lambda j: -rk0[j])[:3]:
+            cand = base_queries[i][3]
+            top5 = np.argsort(-sc0[i])[:5]
+            top5_names = ", ".join(str(company_names[cand[j]]) for j in top5)
+            case_lines.append(f"- Patent `{patent_ids[base_queries[i][0]]}` (IPC {base_queries[i][2]}): "
+                              f"true buyer **{company_names[base_queries[i][1]]}** ranked #{rk0[i]}; "
+                              f"{cs_model} top-5 = [{top5_names}]")
+        case_study_text = "\n".join(case_lines) if case_lines else "(no test queries)"
+    else:
+        case_study_text = "(case study unavailable)"
 
     # NEW-12: bootstrap CI over test queries (pooled across seeds)
     boot_table = "| Model | NDCG@10 [95% CI] | Hits@10 [95% CI] | MRR [95% CI] |\n"
