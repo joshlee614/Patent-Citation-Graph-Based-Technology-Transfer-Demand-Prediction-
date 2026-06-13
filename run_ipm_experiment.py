@@ -1,0 +1,1406 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+import random
+import argparse
+from scipy.stats import spearmanr, mannwhitneyu, wilcoxon, ttest_rel
+from sklearn.metrics import roc_auc_score, average_precision_score
+from scipy.sparse import coo_matrix, diags
+from scipy.sparse.linalg import svds
+from torch_geometric.data import HeteroData
+from torch_geometric.utils import dropout_edge, softmax
+from statsmodels.stats.multitest import multipletests
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set plotting style
+plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+
+# Global variables
+KS = (1, 3, 5, 10)
+
+# Custom GNN layers
+class SageLayer(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.lin_self = nn.Linear(in_dim, out_dim)
+        self.lin_neigh = nn.Linear(in_dim, out_dim)
+        
+    def forward(self, x_self, x_neigh, edge_index, size):
+        src = edge_index[0]
+        dst = edge_index[1]
+        
+        neigh_sum = torch.zeros(size[1], x_neigh.size(1), device=x_self.device)
+        counts = torch.zeros(size[1], 1, device=x_self.device)
+        ones = torch.ones(src.size(0), 1, device=x_self.device)
+        
+        neigh_sum.scatter_add_(0, dst.unsqueeze(-1).expand(-1, x_neigh.size(1)), x_neigh[src])
+        counts.scatter_add_(0, dst.unsqueeze(-1), ones)
+        
+        neigh_mean = neigh_sum / (counts + 1e-10)
+        out = self.lin_self(x_self) + self.lin_neigh(neigh_mean)
+        return F.relu(out)
+
+class GatLayer(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.lin_self = nn.Linear(in_dim, out_dim)
+        self.lin_neigh = nn.Linear(in_dim, out_dim)
+        self.att_self = nn.Parameter(torch.Tensor(1, out_dim))
+        self.att_neigh = nn.Parameter(torch.Tensor(1, out_dim))
+        nn.init.xavier_uniform_(self.att_self)
+        nn.init.xavier_uniform_(self.att_neigh)
+        
+    def forward(self, x_self, x_neigh, edge_index, size):
+        src = edge_index[0]
+        dst = edge_index[1]
+        
+        h_self = self.lin_self(x_self)
+        h_neigh = self.lin_neigh(x_neigh)
+        
+        alpha_self = (h_self * self.att_self).sum(-1)
+        alpha_neigh = (h_neigh * self.att_neigh).sum(-1)
+        
+        alpha = alpha_self[dst] + alpha_neigh[src]
+        alpha = F.leaky_relu(alpha, negative_slope=0.2)
+        
+        alpha_softmax = softmax(alpha, dst, num_nodes=size[1])
+        
+        out = torch.zeros_like(h_self)
+        out.scatter_add_(0, dst.unsqueeze(-1).expand(-1, h_self.size(1)), alpha_softmax.unsqueeze(-1) * h_neigh[src])
+        return out, alpha_softmax
+
+class CustomHeteroGNN(nn.Module):
+    def __init__(self, gnn_type, patent_in, company_in, hidden_dim, out_dim, dropout, apply_dropedge=False, use_time=False):
+        super().__init__()
+        self.gnn_type = gnn_type
+        self.dropout = dropout
+        self.apply_dropedge = apply_dropedge
+        self.use_time = use_time
+        
+        if use_time:
+            self.patent_lin = nn.Linear(patent_in + 16, hidden_dim)
+        else:
+            self.patent_lin = nn.Linear(patent_in, hidden_dim)
+            
+        self.company_lin = nn.Linear(company_in, hidden_dim)
+        
+        if gnn_type == 'SAGE':
+            self.sage_c2p = SageLayer(hidden_dim, out_dim)
+            self.sage_p2c = SageLayer(hidden_dim, out_dim)
+            self.sage_p2p = SageLayer(hidden_dim, out_dim)
+        elif gnn_type == 'GAT':
+            self.gat_c2p = GatLayer(hidden_dim, out_dim)
+            self.gat_p2c = GatLayer(hidden_dim, out_dim)
+            self.gat_p2p = GatLayer(hidden_dim, out_dim)
+            
+    def forward(self, x_dict, edge_index_dict, time_enc=None, return_attn=False):
+        xp = x_dict['patent']
+        if self.use_time and time_enc is not None:
+            xp = torch.cat([xp, time_enc], dim=-1)
+            
+        xp = self.patent_lin(xp).relu()
+        xc = self.company_lin(x_dict['company']).relu()
+        
+        cites_edge = edge_index_dict[('patent', 'cites', 'patent')]
+        if self.training and self.apply_dropedge:
+            mask = torch.rand(cites_edge.size(1), device=cites_edge.device) >= 0.2
+            cites_edge = cites_edge[:, mask]
+            
+        if self.gnn_type == 'MLP':
+            return {'patent': xp, 'company': xc}
+            
+        elif self.gnn_type == 'SAGE':
+            hp_new = self.sage_c2p(xp, xc, edge_index_dict[('company', 'buys', 'patent')], (xc.size(0), xp.size(0)))
+            hc_new = self.sage_p2c(xc, xp, edge_index_dict[('patent', 'rev_buys', 'company')], (xp.size(0), xc.size(0)))
+            hp_cites = self.sage_p2p(xp, xp, cites_edge, (xp.size(0), xp.size(0)))
+            
+            hp_final = F.dropout(hp_new + hp_cites, p=self.dropout, training=self.training)
+            hc_final = F.dropout(hc_new, p=self.dropout, training=self.training)
+            return {'patent': hp_final, 'company': hc_final}
+            
+        elif self.gnn_type == 'GAT':
+            hp_new, att_c2p = self.gat_c2p(xp, xc, edge_index_dict[('company', 'buys', 'patent')], (xc.size(0), xp.size(0)))
+            hc_new, att_p2c = self.gat_p2c(xc, xp, edge_index_dict[('patent', 'rev_buys', 'company')], (xp.size(0), xc.size(0)))
+            hp_cites, att_p2p = self.gat_p2p(xp, xp, cites_edge, (xp.size(0), xp.size(0)))
+            
+            hp_final = F.dropout(hp_new + hp_cites, p=self.dropout, training=self.training)
+            hc_final = F.dropout(hc_new, p=self.dropout, training=self.training)
+            
+            if return_attn:
+                return {'patent': hp_final, 'company': hc_final}, (att_c2p, att_p2c, att_p2p)
+            return {'patent': hp_final, 'company': hc_final}
+
+class FullModel(nn.Module):
+    def __init__(self, gnn_type, patent_in, company_in, hidden_dim=32, out_dim=16, dropout=0.1, apply_dropedge=False, use_time=False):
+        super().__init__()
+        self.gnn = CustomHeteroGNN(gnn_type, patent_in, company_in, hidden_dim, out_dim, dropout, apply_dropedge, use_time)
+        self.patent_lin = self.gnn.patent_lin
+        self.company_lin = self.gnn.company_lin
+        
+    def forward(self, x_dict, edge_index_dict, time_enc=None):
+        return self.gnn(x_dict, edge_index_dict, time_enc)
+
+# Candidate building
+def build_candidates(p, c_pos, ipc4, ipc_company_index, train_transfer_set, n_neg, rng, num_companies):
+    pool_set = ipc_company_index.get(ipc4, set()) - {c_pos}
+    if len(pool_set) <= n_neg:
+        pool = [c for c in pool_set if (p, c) not in train_transfer_set]
+    else:
+        pool_list = list(pool_set)
+        pool = []
+        set_pool = set()
+        attempts = 0
+        n_pool = len(pool_list)
+        while len(pool) < n_neg and attempts < 1000:
+            size_to_sample = min(n_neg * 2, n_pool)
+            idx_cand = rng.choice(n_pool, size=size_to_sample, replace=False)
+            for idx in idx_cand:
+                c = pool_list[idx]
+                if c not in set_pool and (p, c) not in train_transfer_set:
+                    pool.append(c)
+                    set_pool.add(c)
+                    if len(pool) == n_neg:
+                        break
+            attempts += 1
+            
+    is_padded = len(pool) < n_neg
+    if len(pool) < n_neg:
+        needed = n_neg - len(pool)
+        padded = []
+        set_pool = set(pool)
+        set_pool.add(c_pos)
+        while len(padded) < needed:
+            candidates = rng.choice(num_companies, size=needed * 2, replace=True)
+            for c in candidates:
+                c = int(c)
+                if c not in set_pool and (p, c) not in train_transfer_set:
+                    padded.append(c)
+                    set_pool.add(c)
+                    if len(padded) == needed:
+                        break
+        pool = pool + padded
+    return [c_pos] + list(pool), is_padded
+
+# Evaluator helpers
+def get_time_encoding(days, dim=16):
+    freqs = torch.exp(torch.arange(0, dim, 2) * (-np.log(1e4)/dim)).to(days.device)
+    pe = torch.zeros(days.shape[0], dim).to(days.device)
+    pe[:, 0::2] = torch.sin(days[:, None] * freqs)
+    pe[:, 1::2] = torch.cos(days[:, None] * freqs)
+    return pe
+
+def per_query_auc_ap(score_np):
+    labels = np.zeros(len(score_np))
+    labels[0] = 1.0
+    if len(np.unique(score_np)) == 1:
+        return 0.5, 1.0 / len(score_np)
+    auc = roc_auc_score(labels, score_np)
+    ap = average_precision_score(labels, score_np)
+    return auc, ap
+
+def per_query_metrics(rank, ks=KS):
+    out = {}
+    for k in ks:
+        out[f"hits@{k}"] = float(rank <= k)
+        out[f"ndcg@{k}"] = (1.0 / np.log2(rank + 1)) if rank <= k else 0.0
+    out["mrr"] = 1.0 / rank
+    out["map"] = 1.0 / rank  # MAP equals MRR for single-positive per query
+    return out
+
+def aggregate(rank_list, ks=KS):
+    metrics = [per_query_metrics(r, ks) for r in rank_list]
+    keys = metrics[0].keys()
+    return {k: float(np.mean([m[k] for m in metrics])) for k in keys}
+
+# Debiased neg sampling
+def sample_neg_debiased(n_samples, train_pop, alpha, rng, num_companies):
+    prob = (train_pop + 1.0) ** alpha
+    prob = prob / prob.sum()
+    return rng.choice(num_companies, size=n_samples, p=prob)
+
+# CF Models
+class LightGCN(nn.Module):
+    def __init__(self, n_p, n_c, dim=64, n_layers=3):
+        super().__init__()
+        self.emb_p = nn.Embedding(n_p, dim)
+        self.emb_c = nn.Embedding(n_c, dim)
+        nn.init.normal_(self.emb_p.weight, std=0.1)
+        nn.init.normal_(self.emb_c.weight, std=0.1)
+        self.n_layers = n_layers
+        
+    def propagate(self, norm_adj):
+        x = torch.cat([self.emb_p.weight, self.emb_c.weight], 0)
+        outs = [x]
+        for _ in range(self.n_layers):
+            x = torch.sparse.mm(norm_adj, x)
+            outs.append(x)
+        x = torch.stack(outs, 0).mean(0)
+        return x[:self.emb_p.num_embeddings], x[self.emb_p.num_embeddings:]
+
+class NGCFLayer(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.w1 = nn.Linear(in_dim, out_dim)
+        self.w2 = nn.Linear(in_dim, out_dim)
+        
+    def forward(self, norm_adj, x):
+        neighbor_x = torch.sparse.mm(norm_adj, x)
+        out = self.w1(x) + self.w2(x * neighbor_x)
+        return F.leaky_relu(out, negative_slope=0.2)
+
+class NGCF(nn.Module):
+    def __init__(self, n_p, n_c, dim=64, n_layers=2):
+        super().__init__()
+        self.emb_p = nn.Embedding(n_p, dim)
+        self.emb_c = nn.Embedding(n_c, dim)
+        nn.init.normal_(self.emb_p.weight, std=0.1)
+        nn.init.normal_(self.emb_c.weight, std=0.1)
+        self.layers = nn.ModuleList([NGCFLayer(dim, dim) for _ in range(n_layers)])
+        # Projection layer to map multi-layer concatenation back to 'dim' to match scoring alignment
+        self.proj_out = nn.Linear(dim * (n_layers + 1), dim)
+        
+    def propagate(self, norm_adj):
+        x = torch.cat([self.emb_p.weight, self.emb_c.weight], 0)
+        outs = [x]
+        for layer in self.layers:
+            x = layer(norm_adj, x)
+            outs.append(x)
+        x = torch.cat(outs, dim=-1)
+        x_proj = self.proj_out(x)
+        return x_proj[:self.emb_p.num_embeddings], x_proj[self.emb_p.num_embeddings:]
+
+def get_norm_adj(train_edge_index, n_p, n_c):
+    row = torch.cat([train_edge_index[1], train_edge_index[0] + n_p])
+    col = torch.cat([train_edge_index[0] + n_p, train_edge_index[1]])
+    val = torch.ones(row.size(0))
+    
+    deg = torch.zeros(n_p + n_c)
+    deg.scatter_add_(0, row, val)
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+    
+    val_norm = deg_inv_sqrt[row] * val * deg_inv_sqrt[col]
+    indices = torch.stack([row, col])
+    norm_adj = torch.sparse_coo_tensor(indices, val_norm, (n_p + n_c, n_p + n_c)).coalesce()
+    return norm_adj
+
+# Helper to compute NDCG in batches to save memory
+@torch.no_grad()
+def compute_ndcg_from_embeddings(hp, hc, p_t, cand_t, batch_size=10000):
+    ndcgs = []
+    num_queries = p_t.size(0)
+    for i in range(0, num_queries, batch_size):
+        batch_p = p_t[i : i + batch_size]
+        batch_cand = cand_t[i : i + batch_size]
+        
+        hp_q = hp[batch_p]
+        hc_q = hc[batch_cand]
+        scores = torch.bmm(hc_q, hp_q.unsqueeze(-1)).squeeze(-1)
+        ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
+        ndcg = 1.0 / torch.log2(ranks.float() + 1.0)
+        ndcg[ranks > 10] = 0.0
+        ndcgs.append(ndcg.cpu())
+    return torch.cat(ndcgs).mean().item()
+
+# GNN early stopping val evaluator (vectorized & batched)
+@torch.no_grad()
+def compute_val_ndcg(model, data, val_p_t, val_cand_t, device):
+    model.eval()
+    x_dict = {
+        'patent': data['patent'].x,
+        'company': data['company'].x
+    }
+    node_embs = model(x_dict, data.edge_index_dict)
+    hp = node_embs['patent']
+    hc = node_embs['company']
+    return compute_ndcg_from_embeddings(hp, hc, val_p_t, val_cand_t)
+
+# CF early stopping val evaluator (vectorized & batched)
+@torch.no_grad()
+def compute_val_ndcg_cf(model, norm_adj, val_p_t, val_cand_t, device):
+    model.eval()
+    hp, hc = model.propagate(norm_adj.to(device))
+    return compute_ndcg_from_embeddings(hp, hc, val_p_t, val_cand_t)
+
+def train_cf_model(model, norm_adj, train_edge_index, max_epochs, lr, device, val_queries=None, patience=5):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    model.to(device)
+    norm_adj = norm_adj.to(device)
+    n_c = model.emb_c.num_embeddings
+    
+    best_val_ndcg = -1.0
+    best_state = None
+    patience_counter = 0
+    
+    val_p_t, val_cand_t = None, None
+    if val_queries is not None:
+        val_p_t = torch.tensor([q[0] for q in val_queries], dtype=torch.long).to(device)
+        val_cand_t = torch.tensor([q[3] for q in val_queries], dtype=torch.long).to(device)
+    
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        optimizer.zero_grad()
+        hp, hc = model.propagate(norm_adj)
+        
+        c_pos = train_edge_index[0].to(device)
+        p = train_edge_index[1].to(device)
+        pos_score = (hp[p] * hc[c_pos]).sum(-1)
+        
+        c_neg = torch.randint(0, n_c, (c_pos.size(0),), device=device)
+        neg_score = (hp[p] * hc[c_neg]).sum(-1)
+        
+        loss = -torch.log(torch.sigmoid(pos_score - neg_score) + 1e-10).mean()
+        loss.backward()
+        optimizer.step()
+        
+        # Validation evaluation
+        if val_p_t is not None:
+            val_ndcg = compute_val_ndcg_cf(model, norm_adj, val_p_t, val_cand_t, device)
+            if val_ndcg > best_val_ndcg:
+                best_val_ndcg = val_ndcg
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+                
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+
+# Training GNN
+def get_train_neg_edges(train_edge_index, train_pop, alpha, seed, num_companies):
+    n_samples = train_edge_index.size(1)
+    rng = np.random.default_rng(seed)
+    if alpha == 0.0:
+        neg_c = torch.randint(0, num_companies, (n_samples,))
+    else:
+        prob = (train_pop + 1.0) ** alpha
+        prob = prob / prob.sum()
+        neg_c = torch.from_numpy(rng.choice(num_companies, size=n_samples, p=prob))
+    return torch.stack([neg_c, train_edge_index[1].cpu()], dim=0)
+
+def compute_loss_logq(pos_score, neg_score, pos_c, neg_c, train_pop, logq_alpha):
+    q = (train_pop + 1.0) ** logq_alpha
+    q = q / q.sum()
+    log_q = torch.log(torch.tensor(q, dtype=torch.float32, device=pos_score.device) + 1e-10)
+    
+    pos_score_corr = pos_score - log_q[pos_c]
+    neg_score_corr = neg_score - log_q[neg_c]
+    
+    scores = torch.cat([pos_score_corr, neg_score_corr])
+    labels = torch.cat([torch.ones(len(pos_score)), torch.zeros(len(neg_score))]).to(pos_score.device)
+    return F.binary_cross_entropy_with_logits(scores, labels)
+
+def train_gnn(model, data, train_edge_index, train_pop, debias_alpha, logq_alpha, max_epochs, lr, device, seed, num_companies, val_queries=None, patience=5):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = torch.nn.BCEWithLogitsLoss()
+    model.to(device)
+    
+    best_val_ndcg = -1.0
+    best_state = None
+    patience_counter = 0
+    
+    val_p_t, val_cand_t = None, None
+    if val_queries is not None:
+        val_p_t = torch.tensor([q[0] for q in val_queries], dtype=torch.long).to(device)
+        val_cand_t = torch.tensor([q[3] for q in val_queries], dtype=torch.long).to(device)
+    
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        optimizer.zero_grad()
+        
+        train_neg_edge = get_train_neg_edges(train_edge_index, train_pop, debias_alpha, seed + epoch, num_companies)
+        train_label_index = torch.cat([train_edge_index, train_neg_edge.to(device)], dim=1)
+        train_label = torch.cat([torch.ones(train_edge_index.size(1)), torch.zeros(train_neg_edge.size(1))]).to(device)
+        
+        x_dict = {
+            'patent': data['patent'].x,
+            'company': data['company'].x
+        }
+        node_embs = model(x_dict, data.edge_index_dict)
+        hp = node_embs['patent']
+        hc = node_embs['company']
+        
+        src_c = train_label_index[0]
+        dst_p = train_label_index[1]
+        out = (hc[src_c] * hp[dst_p]).sum(-1)
+        
+        if logq_alpha > 0.0:
+            pos_score = out[:train_edge_index.size(1)]
+            neg_score = out[train_edge_index.size(1):]
+            pos_c = train_edge_index[0]
+            neg_c = train_neg_edge[0].to(device)
+            loss = compute_loss_logq(pos_score, neg_score, pos_c, neg_c, train_pop, logq_alpha)
+        else:
+            loss = criterion(out, train_label.float())
+            
+        loss.backward()
+        optimizer.step()
+        
+        # Validation evaluation & Early stopping check
+        if val_p_t is not None:
+            val_ndcg = compute_val_ndcg(model, data, val_p_t, val_cand_t, device)
+            if val_ndcg > best_val_ndcg:
+                best_val_ndcg = val_ndcg
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+                
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+
+# Helper to batch evaluations
+@torch.no_grad()
+def evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta=0.0, batch_size=10000):
+    all_ranks = []
+    all_aucs = []
+    all_aps = []
+    all_scores = []
+    all_pops = []
+    
+    num_queries = test_p_t.size(0)
+    for i in range(0, num_queries, batch_size):
+        batch_p = test_p_t[i : i + batch_size]
+        batch_cand = test_cand_t[i : i + batch_size]
+        
+        hp_q = hp[batch_p]
+        hc_q = hc[batch_cand]
+        scores = torch.bmm(hc_q, hp_q.unsqueeze(-1)).squeeze(-1)
+        
+        if ips_beta > 0.0:
+            pen = ips_beta * torch.log(train_pop_t[batch_cand] + 1.0)
+            scores = scores - pen
+            
+        ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
+        aucs = (scores[:, 0:1] > scores[:, 1:]).float().mean(dim=-1)
+        aps = 1.0 / ranks.float()
+        
+        all_ranks.extend(ranks.cpu().numpy().tolist())
+        all_aucs.extend(aucs.cpu().numpy().tolist())
+        all_aps.extend(aps.cpu().numpy().tolist())
+        all_scores.append(scores.cpu().numpy())
+        all_pops.append(train_pop_t[batch_cand].cpu().numpy())
+        
+    return all_ranks, all_aucs, all_aps, np.concatenate(all_scores, axis=0), np.concatenate(all_pops, axis=0)
+
+# Evaluation wrappers (vectorized & batched)
+@torch.no_grad()
+def evaluate_gnn(model, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0):
+    model.eval()
+    x_dict = {
+        'patent': data['patent'].x,
+        'company': data['company'].x
+    }
+    node_embs = model(x_dict, data.edge_index_dict)
+    hp = node_embs['patent']
+    hc = node_embs['company']
+    return evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta)
+
+def evaluate_mlp(model, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0):
+    return evaluate_gnn(model, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta)
+
+@torch.no_grad()
+def evaluate_cf_model(model, norm_adj, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0):
+    model.eval()
+    hp, hc = model.propagate(norm_adj.to(device))
+    return evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta)
+
+def evaluate_mostpop(test_cand_t, train_pop_t):
+    scores = train_pop_t[test_cand_t].float()
+    ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
+    aucs = (scores[:, 0:1] > scores[:, 1:]).float().mean(dim=-1)
+    aps = 1.0 / ranks.float()
+    return (
+        ranks.cpu().numpy().tolist(),
+        aucs.cpu().numpy().tolist(),
+        aps.cpu().numpy().tolist(),
+        scores.cpu().numpy(),
+        scores.cpu().numpy()
+    )
+
+def evaluate_recency(test_cand_t, company_last_active_t, train_pop_t):
+    scores = company_last_active_t[test_cand_t].float()
+    ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
+    aucs = (scores[:, 0:1] > scores[:, 1:]).float().mean(dim=-1)
+    aps = 1.0 / ranks.float()
+    return (
+        ranks.cpu().numpy().tolist(),
+        aucs.cpu().numpy().tolist(),
+        aps.cpu().numpy().tolist(),
+        scores.cpu().numpy(),
+        train_pop_t[test_cand_t].cpu().numpy()
+    )
+
+def evaluate_svd(queries, train_csr, k_dim, device, train_pop_t):
+    p_t = torch.tensor([q[0] for q in queries], dtype=torch.long).to(device)
+    cand_t = torch.tensor([q[3] for q in queries], dtype=torch.long).to(device)
+    
+    k_actual = min(k_dim, min(train_csr.shape) - 1)
+    from sklearn.utils.extmath import randomized_svd
+    from scipy.sparse.linalg import svds
+    try:
+        U, Sigma, VT = randomized_svd(train_csr, n_components=k_actual, random_state=42)
+    except Exception:
+        U, Sigma, VT = svds(train_csr, k=k_actual, solver='arpack')
+    U_sigma = torch.tensor((U * Sigma).copy(), dtype=torch.float32).to(device)
+    VT_T = torch.tensor(VT.T.copy(), dtype=torch.float32).to(device)
+    return evaluate_embeddings(VT_T, U_sigma, p_t, cand_t, train_pop_t, ips_beta=0.0)
+
+# Inversion rate helper (vectorized)
+def compute_inversion_rate(queries, scores_all, train_pop, pop_thr_q=0.9):
+    thr = np.quantile(train_pop, pop_thr_q) if len(train_pop) > 0 else 0.0
+    neg_cands = np.array([q[3][1:] for q in queries]) # shape (NUM_QUERIES, 100)
+    neg_pops = train_pop[neg_cands] # shape (NUM_QUERIES, 100)
+    is_hard_neg = neg_pops >= thr # shape (NUM_QUERIES, 100)
+    pos_scores = scores_all[:, 0:1] # shape (NUM_QUERIES, 1)
+    neg_scores = scores_all[:, 1:] # shape (NUM_QUERIES, 100)
+    is_inversion = neg_scores > pos_scores # shape (NUM_QUERIES, 100)
+    inversion_count = (is_inversion & is_hard_neg).sum()
+    total_count = is_hard_neg.sum()
+    return inversion_count / (total_count + 1e-10)
+
+def citation_depth(target_patent_idx, company_patent_idxs, cited_by, max_depth=5):
+    """
+    Shortest path (in citation hops) from target_patent_idx
+    back to any patent owned by the company.
+    company_patent_idxs: set of patent indices owned/transferred by the company.
+    Returns depth (1 = direct citation), or float('inf') if not reachable.
+    """
+    if target_patent_idx in company_patent_idxs:
+        return 1
+    visited = {target_patent_idx}
+    frontier = {target_patent_idx}
+    for depth in range(1, max_depth + 1):
+        next_frontier = set()
+        for p in frontier:
+            for citer in cited_by.get(p, []):
+                if citer in company_patent_idxs:
+                    return depth
+                if citer not in visited:
+                    visited.add(citer)
+                    next_frontier.add(citer)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return float('inf')
+
+def demand_score_rank(p_idx, c_pos_idx, cand, version,
+                      train_pop, company_last_active, patent_ipc,
+                      patent_indegree, ipc4_mean_cit, ipc4_global_mean,
+                      power_threshold, STRATEGIC_IPC4,
+                      company_patents, cited_by, all_patents_list):
+    DEPTH_DECAY_BASE = 0.6
+    DIV_LOG_MAX = 13
+    BOOST_STRATEGIC = 1.20
+    BOOST_POWER = 1.10
+    BOOST_MAX = BOOST_STRATEGIC * BOOST_POWER  # 1.32
+
+    p_ipc4 = patent_ipc.get(all_patents_list[p_idx], 'UNKNOWN')
+    ipc_avg = ipc4_mean_cit.get(p_ipc4, ipc4_global_mean) or 1.0
+    global_avg = ipc4_global_mean or 1.0
+    p_global_cit = patent_indegree[p_idx]
+    is_power = p_global_cit >= power_threshold
+    is_strategic = p_ipc4 in STRATEGIC_IPC4
+
+    scores = []
+    for c in cand:
+        c_pats = company_patents.get(c, set())
+        cit_count = sum(
+            1 for cp in c_pats if p_idx in cited_by.get(cp, [])
+        )
+        unique = len(c_pats)
+        depth = citation_depth(p_idx, c_pats, cited_by)
+        rec = company_last_active[c]
+        transfer_count = train_pop[c]
+
+        if version == 'original':
+            ipc_ratio = (cit_count + 0.02 * p_global_cit) / ipc_avg * 100
+            freq_score = min(100.0, ipc_ratio)
+            depth_score = (100.0 / (depth ** 1.5)) if depth < float('inf') else 0.0
+            div_score = min(100.0, unique * 25.0)
+        else:  # revised
+            ipc_norm    = min(cit_count / ipc_avg, 2.0) / 2.0
+            global_norm = min(p_global_cit / global_avg, 2.0) / 2.0
+            freq_score  = ((ipc_norm * 0.8) + (global_norm * 0.2)) * 100
+            depth_score = (100.0 * (DEPTH_DECAY_BASE ** (depth - 1))
+                           if depth < float('inf') else 0.0)
+            div_score   = (
+                (np.log(unique + 1) / np.log(DIV_LOG_MAX + 1)) * 100
+            )
+
+        max_days = max(company_last_active) or 1.0
+        recent_score   = (rec / max_days) * 100.0
+        transfer_score = min(100.0, transfer_count * 10.0)
+
+        total = (0.30 * freq_score
+               + 0.25 * recent_score
+               + 0.20 * depth_score
+               + 0.15 * div_score
+               + 0.10 * transfer_score)
+
+        boost = 1.0
+        if is_strategic:
+            boost *= BOOST_STRATEGIC
+        if is_power:
+            boost *= BOOST_POWER
+        boost = min(boost, BOOST_MAX)
+        total *= boost
+        scores.append(total)
+
+    order = np.argsort(-np.array(scores), kind='stable')
+    return int(np.where(order == 0)[0][0]) + 1, scores
+
+# Main function
+def main():
+    parser = argparse.ArgumentParser(description="IPM Experiment Suite")
+    parser.add_argument("--mode", type=str, choices=["fast", "full"], default="fast")
+    parser.add_argument("--seeds", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--n_neg", type=int, default=None)
+    parser.add_argument("--artifact_dir", type=str, default="/Users/isang-won/.gemini/antigravity-ide/brain/f07284b4-b329-432d-aea6-12b660432bcc")
+    args = parser.parse_args()
+    
+    if args.mode == "fast":
+        num_seeds = args.seeds if args.seeds is not None else 2
+        max_epochs = args.epochs if args.epochs is not None else 5
+        n_neg = args.n_neg if args.n_neg is not None else 20
+        print("Running in FAST mode (Subsampled dataset, 2 seeds, 5 epochs, 20 hard negatives)...")
+    else:
+        num_seeds = args.seeds if args.seeds is not None else 10
+        max_epochs = args.epochs if args.epochs is not None else 50
+        n_neg = args.n_neg if args.n_neg is not None else 100
+        print("Running in FULL mode (Full dataset, 10 seeds, 50 epochs, 100 hard negatives)...")
+        
+    SEEDS = list(range(num_seeds))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"Device: {device}")
+    
+    # Load Data
+    data_dir = 'kipris-csv'
+    print("Loading datasets...")
+    patents_df = pd.read_csv(os.path.join(data_dir, 'patents.csv'), usecols=['patApplicationNumber', 'patIpcNumber'], low_memory=False)
+    transfers_df = pd.read_csv(os.path.join(data_dir, 'transfers.csv'), usecols=['trApplicationNumber', 'trCorrelatorName', 'trRegistrationDate'], low_memory=False)
+    citings_df = pd.read_csv(os.path.join(data_dir, 'citings.csv'), usecols=['citStandardApplicationNumber', 'citApplicationNumber'], low_memory=False)
+    
+    def clean_app_num(series):
+        return series.astype(str).str.replace(r'[^0-9]', '', regex=True)
+        
+    patents_df['patApplicationNumber'] = clean_app_num(patents_df['patApplicationNumber'])
+    transfers_df['trApplicationNumber'] = clean_app_num(transfers_df['trApplicationNumber'])
+    citings_df['citStandardApplicationNumber'] = clean_app_num(citings_df['citStandardApplicationNumber'])
+    citings_df['citApplicationNumber'] = clean_app_num(citings_df['citApplicationNumber'])
+    
+    transfers_df['trCorrelatorName'] = transfers_df['trCorrelatorName'].fillna('UNKNOWN')
+    
+    if args.mode == "fast":
+        print("Slicing data for fast execution...")
+        top_companies = transfers_df['trCorrelatorName'].value_counts().head(500).index
+        transfers_df = transfers_df[transfers_df['trCorrelatorName'].isin(top_companies)].copy()
+        unique_pats = transfers_df['trApplicationNumber'].unique()
+        if len(unique_pats) > 2000:
+            unique_pats = unique_pats[:2000]
+            transfers_df = transfers_df[transfers_df['trApplicationNumber'].isin(unique_pats)].copy()
+        patents_df = patents_df[patents_df['patApplicationNumber'].isin(unique_pats)].copy()
+        citings_df = citings_df[citings_df['citStandardApplicationNumber'].isin(unique_pats) & citings_df['citApplicationNumber'].isin(unique_pats)].copy()
+        
+    # Mappings
+    patent_ids = patents_df['patApplicationNumber'].unique()
+    patent2idx = {pid: i for i, pid in enumerate(patent_ids)}
+    company_names = transfers_df['trCorrelatorName'].astype(str).unique()
+    company2idx = {c: i for i, c in enumerate(company_names)}
+    
+    NUM_PATENTS = len(patent2idx)
+    NUM_COMPANIES = len(company2idx)
+    print(f"Patents: {NUM_PATENTS}, Companies: {NUM_COMPANIES}")
+    
+    # Load and Slice SBERT embeddings
+    print("Loading SBERT embeddings...")
+    original_patents_df = pd.read_csv(os.path.join(data_dir, 'patents.csv'), usecols=['patApplicationNumber'], low_memory=False)
+    original_patents_df['patApplicationNumber'] = clean_app_num(original_patents_df['patApplicationNumber'])
+    original_patent_ids = original_patents_df['patApplicationNumber'].unique()
+    orig_patent2idx = {pid: i for i, pid in enumerate(original_patent_ids)}
+    
+    full_patent_x = torch.load('patent_embeddings.pt', map_location='cpu')
+    patent_x_list = [full_patent_x[orig_patent2idx[pid]] for pid in patent_ids]
+    patent_x = torch.stack(patent_x_list)
+    del full_patent_x
+    del patent_x_list
+    
+    # Pre-sort transfers by registration date
+    transfers_df['trRegistrationDate'] = transfers_df['trRegistrationDate'].astype(str).str.replace(r'[^0-9\-]', '', regex=True)
+    transfers_df['trRegistrationDate'] = pd.to_datetime(transfers_df['trRegistrationDate'], errors='coerce')
+    transfers_df = transfers_df.dropna(subset=['trRegistrationDate']).sort_values('trRegistrationDate').reset_index(drop=True)
+    
+    n_transfers = len(transfers_df)
+    train_end = int(n_transfers * 0.70)
+    val_end = int(n_transfers * 0.85)
+    train_df = transfers_df.iloc[:train_end]
+    val_df = transfers_df.iloc[train_end:val_end]
+    test_df = transfers_df.iloc[val_end:]
+    
+    # IPC lists
+    patents_df['ipc4'] = patents_df['patIpcNumber'].astype(str).str[:4]
+    patent_ipc = dict(zip(patents_df['patApplicationNumber'], patents_df['ipc4']))
+    all_patents_list = list(patent_ids)
+    
+    # Build transfer sets
+    train_transfer_set = set(zip(train_df['trApplicationNumber'].map(patent2idx), train_df['trCorrelatorName'].map(company2idx)))
+    
+    ipc_company_index = {}
+    train_apps = train_df['trApplicationNumber'].to_numpy()
+    train_corrs = train_df['trCorrelatorName'].to_numpy()
+    for i in range(len(train_df)):
+        c = company2idx[train_corrs[i]]
+        ipc4 = patent_ipc.get(train_apps[i], 'UNKNOWN')
+        if ipc4 not in ipc_company_index:
+            ipc_company_index[ipc4] = set()
+        ipc_company_index[ipc4].add(c)
+        
+    # Popularity & Recency features
+    train_pop = np.zeros(NUM_COMPANIES)
+    company_counts = train_df['trCorrelatorName'].value_counts()
+    for c in company_names:
+        train_pop[company2idx[c]] = company_counts.get(c, 0)
+        
+    company_last_active = np.zeros(NUM_COMPANIES)
+    ref_date = train_df['trRegistrationDate'].min() if len(train_df) > 0 else pd.Timestamp('1980-01-01')
+    train_df['days'] = (train_df['trRegistrationDate'] - ref_date).dt.total_seconds() / 86400.0
+    company_last_days = train_df.groupby('trCorrelatorName')['days'].max()
+    for c in company_names:
+        if c in company_last_days:
+            company_last_active[company2idx[c]] = company_last_days[c]
+        else:
+            company_last_active[company2idx[c]] = -1.0
+            
+    # Patent time encoding features
+    patent_time = np.zeros(NUM_PATENTS)
+    patent_first_transfer = train_df.groupby('trApplicationNumber')['days'].min()
+    for p in patent_ids:
+        if p in patent_first_transfer:
+            patent_time[patent2idx[p]] = patent_first_transfer[p]
+    max_days = train_df['days'].max() if len(train_df) > 0 else 1.0
+    patent_time = patent_time / max_days
+    patent_time_t = torch.tensor(patent_time, dtype=torch.float).to(device)
+    
+    # ─────────────────────────────────────────────────────────────
+    # Precomputing Demand Score helper structures (corrected specs)
+    # ─────────────────────────────────────────────────────────────
+    print("Precomputing citation structures for Demand Score...")
+    
+    # 1. Build cited_by (cited -> citing) from citings_df mapping
+    valid_cites = citings_df[citings_df['citStandardApplicationNumber'].isin(patent2idx) & citings_df['citApplicationNumber'].isin(patent2idx)]
+    citing_p = valid_cites['citStandardApplicationNumber'].map(patent2idx).to_numpy()
+    cited_p = valid_cites['citApplicationNumber'].map(patent2idx).to_numpy()
+    
+    from collections import defaultdict
+    cited_by = defaultdict(list)
+    for cit, cited in zip(citing_p, cited_p):
+        cited_by[cited].append(cit)
+        
+    # 2. Global in-degree per patent (for power-patent threshold)
+    patent_indegree = np.zeros(NUM_PATENTS)
+    for p, citers in cited_by.items():
+        patent_indegree[p] = len(citers)
+    power_threshold = np.percentile(patent_indegree, 90) if len(patent_indegree) > 0 else 0.0
+    
+    # 3. IPC-group mean citation count (for FreqScore normalisation)
+    ipc4_citation_counts = defaultdict(list)
+    for p_idx, p_id in enumerate(patent_ids):
+        ipc4 = patent_ipc.get(p_id, 'UNKNOWN')
+        ipc4_citation_counts[ipc4].append(patent_indegree[p_idx])
+    ipc4_mean_cit = {
+        ipc4: np.mean(counts) if counts else 1.0
+        for ipc4, counts in ipc4_citation_counts.items()
+    }
+    ipc4_global_mean = np.mean(patent_indegree) if len(patent_indegree) > 0 else 1.0
+    
+    # 4. National strategic technology IPC4 codes
+    STRATEGIC_IPC4 = {
+        'G16H', 'G06N', 'H04L', 'H04W', 'G06F',
+        'A61K', 'A61P', 'C12N', 'C12Q',
+        'H01M', 'H02J'
+    }
+    
+    # 5. Patents transferred by each company in the training period
+    company_patents = defaultdict(set)
+    for p, c in train_transfer_set:
+        company_patents[c].add(p)
+        
+    # Pre-generate candidate sets per seed & monitor padding
+    print("Generating hard negative candidate sets...")
+    test_queries_per_seed = {}
+    val_queries_per_seed = {}
+    padding_rates = []
+    
+    print("Pre-converting dataframes to NumPy arrays...")
+    val_apps = val_df['trApplicationNumber'].to_numpy()
+    val_corrs = val_df['trCorrelatorName'].to_numpy()
+    val_list = []
+    for i in range(len(val_df)):
+        p_app = val_apps[i]
+        p = patent2idx[p_app]
+        c_pos = company2idx[val_corrs[i]]
+        ipc4 = patent_ipc.get(p_app, 'UNKNOWN')
+        val_list.append((p, c_pos, ipc4))
+        
+    test_apps = test_df['trApplicationNumber'].to_numpy()
+    test_corrs = test_df['trCorrelatorName'].to_numpy()
+    test_list = []
+    for i in range(len(test_df)):
+        p_app = test_apps[i]
+        p = patent2idx[p_app]
+        c_pos = company2idx[test_corrs[i]]
+        ipc4 = patent_ipc.get(p_app, 'UNKNOWN')
+        test_list.append((p, c_pos, ipc4))
+        
+    rng = np.random.default_rng(SEEDS[0])
+    
+    # Test queries & padding monitor
+    rng_test = np.random.default_rng(SEEDS[0])
+    queries = []
+    padded_count = 0
+    for p, c_pos, ipc4 in test_list:
+        cand, is_padded = build_candidates(p, c_pos, ipc4, ipc_company_index, train_transfer_set, n_neg, rng_test, NUM_COMPANIES)
+        queries.append((p, c_pos, ipc4, cand))
+        if is_padded:
+            padded_count += 1
+            
+    print("Generating validation candidate sets for early stopping...")
+    for seed in SEEDS:
+        rng_val = np.random.default_rng(seed + 10000)  # separate RNG from test
+        val_queries = []
+        for p, c_pos, ipc4 in val_list:
+            cand, _ = build_candidates(p, c_pos, ipc4, ipc_company_index, train_transfer_set, n_neg, rng_val, NUM_COMPANIES)
+            val_queries.append((p, c_pos, ipc4, cand))
+        val_queries_per_seed[seed] = val_queries
+        test_queries_per_seed[seed] = queries
+        padding_rates.append(padded_count / len(test_list) if len(test_list) > 0 else 0.0)
+        
+    avg_padding_rate = np.mean(padding_rates)
+    print(f"Average candidate padding rate: {avg_padding_rate:.2%}")
+    
+    # Set up PyG HeteroData structure
+    data = HeteroData()
+    data['patent'].x = patent_x.to(device)
+    company_x = torch.randn(NUM_COMPANIES, 64) * 0.1 # Corrected: company dimension is d=64
+    data['company'].x = company_x.to(device)
+    
+    c_indices = [company2idx[c] for c in train_df['trCorrelatorName']]
+    p_indices = [patent2idx[p] for p in train_df['trApplicationNumber']]
+    data['company', 'buys', 'patent'].edge_index = torch.tensor([c_indices, p_indices], dtype=torch.long).to(device)
+    
+    valid_cites = citings_df[citings_df['citStandardApplicationNumber'].isin(patent2idx) & citings_df['citApplicationNumber'].isin(patent2idx)]
+    citing_p = valid_cites['citStandardApplicationNumber'].map(patent2idx).tolist()
+    cited_p = valid_cites['citApplicationNumber'].map(patent2idx).tolist()
+    data['patent', 'cites', 'patent'].edge_index = torch.tensor([citing_p, cited_p], dtype=torch.long).to(device)
+    
+    data['patent', 'rev_buys', 'company'].edge_index = data['company', 'buys', 'patent'].edge_index[[1, 0]]
+    
+    train_edge_index = data['company', 'buys', 'patent'].edge_index
+    norm_adj = get_norm_adj(train_edge_index.cpu(), NUM_PATENTS, NUM_COMPANIES)
+    
+    # Pre-compute cold start stats so we can delete test_df
+    c_idx_test = test_df['trCorrelatorName'].map(company2idx).dropna().astype(int).values
+    frac_unseen = float(np.mean(train_pop[c_idx_test] == 0) if len(c_idx_test) > 0 else 0.0)
+    frac_rare = float(np.mean(train_pop[c_idx_test] <= 1) if len(c_idx_test) > 0 else 0.0)
+    
+    # Garbage collection of large unused DataFrames
+    import gc
+    del patents_df
+    del transfers_df
+    del citings_df
+    del train_df
+    del val_df
+    del test_df
+    del valid_cites
+    del original_patents_df
+    gc.collect()
+    
+    # Dict to collect final results (excluding logQ and Demand models)
+    models = ["MostPop", "Recency", "SVD", "MLP", "LightGCN", "NGCF", "GraphSAGE", "GAT", "GAT+DropEdge", "GAT+Time", "GraphSAGE+Debias", "GraphSAGE+IPS"]
+    metrics_by_model = {m: [] for m in models}
+    
+    # Collections for diagnostic correlation (all models)
+    spearman_by_model = {m: [] for m in models}
+    
+    # For inversion rate and Wilcoxon test, we need per-seed query scores and ranks
+    ranks_by_model_by_seed = {m: {} for m in models}
+    scores_by_model_by_seed = {m: {} for m in models}
+    
+    # Stratification (Option b)
+    strata_metrics_by_seed = {'head': [], 'torso': [], 'tail': []}
+    
+    # Demand Score comparison tracking
+    demand_orig_ndcg_seeds = []
+    demand_rev_ndcg_seeds = []
+    
+    # Diagnostic collections (first seed GAT)
+    gat_attention_weights = None
+    gat_is_hub_edge = None
+    
+    # IPS and Alpha sweeps
+    betas = [0.0, 0.5, 1.0, 2.0, 4.0]
+    beta_ndcg_seeds = {b: [] for b in betas}
+    alphas = [0.0, 0.5, 0.75, 1.0]
+    alpha_ndcg_seeds = {a: [] for a in alphas}
+    
+    # Run Seeds
+    for seed in SEEDS:
+        print(f"\n--- Running Seed {seed} ---")
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        queries = test_queries_per_seed[seed]
+        val_queries = val_queries_per_seed[seed]
+        
+        # Vectorized query structures
+        val_p_t = torch.tensor([q[0] for q in val_queries], dtype=torch.long).to(device)
+        val_cand_t = torch.tensor([q[3] for q in val_queries], dtype=torch.long).to(device)
+        test_p_t = torch.tensor([q[0] for q in queries], dtype=torch.long).to(device)
+        test_cand_t = torch.tensor([q[3] for q in queries], dtype=torch.long).to(device)
+        train_pop_t = torch.tensor(train_pop, dtype=torch.float32).to(device)
+        company_last_active_t = torch.tensor(company_last_active, dtype=torch.float32).to(device)
+        
+        # Helper to record results
+        def record_model(name, ranks, aucs, aps, scores_all, pop_all):
+            metrics_by_model[name].append(aggregate(ranks))
+            metrics_by_model[name][-1]["auc"] = float(np.mean(aucs))
+            metrics_by_model[name][-1]["ap"] = float(np.mean(aps))
+            
+            # Subsample for spearmanr if too large to save memory/time
+            scores_flat = scores_all.flatten()
+            pop_flat = pop_all.flatten()
+            if len(scores_flat) > 1000000:
+                rng_sub = np.random.default_rng(42)
+                idx_sub = rng_sub.choice(len(scores_flat), size=1000000, replace=False)
+                val = spearmanr(scores_flat[idx_sub], pop_flat[idx_sub])[0]
+            else:
+                val = spearmanr(scores_flat, pop_flat)[0]
+                
+            spearman_by_model[name].append(float(val if not np.isnan(val) else 0.0))
+            ranks_by_model_by_seed[name][seed] = ranks
+            scores_by_model_by_seed[name][seed] = scores_all
+            
+        # 1. MostPop Baseline
+        ranks_mp, aucs_mp, aps_mp, scores_mp, pop_mp = evaluate_mostpop(test_cand_t, train_pop_t)
+        record_model("MostPop", ranks_mp, aucs_mp, aps_mp, scores_mp, pop_mp)
+        
+        # 2. Recency Baseline
+        ranks_rec, aucs_rec, aps_rec, scores_rec, pop_rec = evaluate_recency(test_cand_t, company_last_active_t, train_pop_t)
+        record_model("Recency", ranks_rec, aucs_rec, aps_rec, scores_rec, pop_rec)
+        
+        # 3. SVD Baseline (Rank k=64)
+        train_csr = coo_matrix((np.ones(train_edge_index.size(1)), (train_edge_index[0].cpu().numpy(), train_edge_index[1].cpu().numpy())), shape=(NUM_COMPANIES, NUM_PATENTS)).astype(float).tocsr()
+        ranks_svd, aucs_svd, aps_svd, scores_svd, pop_svd = evaluate_svd(queries, train_csr, 64, device, train_pop_t)
+        record_model("SVD", ranks_svd, aucs_svd, aps_svd, scores_svd, pop_svd)
+        
+        # 4. MLP Baseline
+        mlp = FullModel('MLP', 384, 64).to(device)
+        train_gnn(mlp, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+        ranks_mlp, aucs_mlp, aps_mlp, scores_mlp, pop_mlp = evaluate_mlp(mlp, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+        record_model("MLP", ranks_mlp, aucs_mlp, aps_mlp, scores_mlp, pop_mlp)
+        
+        # 5. LightGCN
+        lgcn = LightGCN(NUM_PATENTS, NUM_COMPANIES, dim=64, n_layers=3)
+        train_cf_model(lgcn, norm_adj, train_edge_index.cpu(), max_epochs=max_epochs, lr=0.01, device=device, val_queries=val_queries, patience=5)
+        ranks_lgcn, aucs_lgcn, aps_lgcn, scores_lgcn, pop_lgcn = evaluate_cf_model(lgcn, norm_adj, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+        record_model("LightGCN", ranks_lgcn, aucs_lgcn, aps_lgcn, scores_lgcn, pop_lgcn)
+        
+        # 6. NGCF
+        ngcf = NGCF(NUM_PATENTS, NUM_COMPANIES, dim=64, n_layers=2)
+        train_cf_model(ngcf, norm_adj, train_edge_index.cpu(), max_epochs=max_epochs, lr=0.01, device=device, val_queries=val_queries, patience=5)
+        ranks_ngcf, aucs_ngcf, aps_ngcf, scores_ngcf, pop_ngcf = evaluate_cf_model(ngcf, norm_adj, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+        record_model("NGCF", ranks_ngcf, aucs_ngcf, aps_ngcf, scores_ngcf, pop_ngcf)
+        
+        # 7. GraphSAGE
+        sage = FullModel('SAGE', 384, 64).to(device)
+        train_gnn(sage, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+        ranks_sage, aucs_sage, aps_sage, scores_sage, pop_sage = evaluate_gnn(sage, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+        record_model("GraphSAGE", ranks_sage, aucs_sage, aps_sage, scores_sage, pop_sage)
+            
+        # 8. GAT
+        gat = FullModel('GAT', 384, 64).to(device)
+        train_gnn(gat, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+        ranks_gat, aucs_gat, aps_gat, scores_gat, pop_gat = evaluate_gnn(gat, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+        record_model("GAT", ranks_gat, aucs_gat, aps_gat, scores_gat, pop_gat)
+        
+        if seed == 0:
+            gat.eval()
+            x_dict = {
+                'patent': data['patent'].x,
+                'company': data['company'].x
+            }
+            _, (att_c2p, att_p2c, att_p2p) = gat.gnn(x_dict, data.edge_index_dict, return_attn=True)
+            gat_attention_weights = att_c2p.cpu().detach().numpy()
+            edge_c_idx = data.edge_index_dict[('company', 'buys', 'patent')][0].cpu().numpy()
+            q95 = np.quantile(train_pop, 0.95)
+            gat_is_hub_edge = train_pop[edge_c_idx] >= q95
+            
+        # Stratification for GAT (Option b)
+        sorted_companies = np.argsort(-train_pop)
+        n_comp = len(sorted_companies)
+        head_set = set(sorted_companies[:n_comp//3])
+        torso_set = set(sorted_companies[n_comp//3:2*n_comp//3])
+        tail_set = set(sorted_companies[2*n_comp//3:])
+        
+        for stratum, cset in [('head', head_set), ('torso', torso_set), ('tail', tail_set)]:
+            stratum_ranks = [
+                r for (_, c_pos, _, _), r in zip(queries, ranks_gat)
+                if c_pos in cset
+            ]
+            if stratum_ranks:
+                strata_metrics_by_seed[stratum].append(aggregate(stratum_ranks))
+            else:
+                strata_metrics_by_seed[stratum].append({"hits@1": 0.0, "hits@3": 0.0, "hits@5": 0.0, "hits@10": 0.0, "mrr": 0.0, "ndcg@10": 0.0})
+                
+        # 9. GAT + DropEdge
+        gat_de = FullModel('GAT', 384, 64, apply_dropedge=True).to(device)
+        train_gnn(gat_de, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+        ranks_gat_de, aucs_gat_de, aps_gat_de, scores_gat_de, pop_gat_de = evaluate_gnn(gat_de, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+        record_model("GAT+DropEdge", ranks_gat_de, aucs_gat_de, aps_gat_de, scores_gat_de, pop_gat_de)
+        
+        # 10. GAT + Time Encoding
+        time_gat = FullModel('GAT', 384, 64, use_time=True).to(device)
+        time_enc = get_time_encoding(patent_time_t, dim=16)
+        optimizer = torch.optim.Adam(time_gat.parameters(), lr=0.01)
+        criterion = torch.nn.BCEWithLogitsLoss()
+        
+        best_val_ndcg = -1.0
+        best_state = None
+        patience = 5
+        patience_counter = 0
+        
+        for epoch in range(1, max_epochs + 1):
+            time_gat.train()
+            optimizer.zero_grad()
+            train_neg_edge = get_train_neg_edges(train_edge_index, train_pop, 0.0, seed + epoch, NUM_COMPANIES)
+            train_label_index = torch.cat([train_edge_index, train_neg_edge.to(device)], dim=1)
+            train_label = torch.cat([torch.ones(train_edge_index.size(1)), torch.zeros(train_neg_edge.size(1))]).to(device)
+            
+            x_dict = {
+                'patent': data['patent'].x,
+                'company': data['company'].x
+            }
+            node_embs = time_gat.gnn(x_dict, data.edge_index_dict, time_enc=time_enc)
+            hp = node_embs['patent']
+            hc = node_embs['company']
+            
+            src_c = train_label_index[0]
+            dst_p = train_label_index[1]
+            out = (hc[src_c] * hp[dst_p]).sum(-1)
+            loss = criterion(out, train_label.float())
+            loss.backward()
+            optimizer.step()
+            
+            # Val evaluation
+            time_gat.eval()
+            with torch.no_grad():
+                node_embs_v = time_gat.gnn({'patent': data['patent'].x, 'company': data['company'].x}, data.edge_index_dict, time_enc=time_enc)
+                hp_v = node_embs_v['patent']
+                hc_v = node_embs_v['company']
+                val_ndcg = compute_ndcg_from_embeddings(hp_v, hc_v, val_p_t, val_cand_t)
+                
+            if val_ndcg > best_val_ndcg:
+                best_val_ndcg = val_ndcg
+                best_state = {k: v.cpu().clone() for k, v in time_gat.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+                    
+        if best_state is not None:
+            time_gat.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+            
+        time_gat.eval()
+        with torch.no_grad():
+            node_embs = time_gat.gnn({'patent': data['patent'].x, 'company': data['company'].x}, data.edge_index_dict, time_enc=time_enc)
+            hp = node_embs['patent']
+            hc = node_embs['company']
+            ranks_time_list, aucs_time_list, aps_time_list, scores_time_list, pop_time_list = evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta=0.0)
+            
+        record_model("GAT+Time", ranks_time_list, aucs_time_list, aps_time_list, scores_time_list, pop_time_list)
+        
+        # 11. GraphSAGE + Debias
+        sage_db = FullModel('SAGE', 384, 64).to(device)
+        train_gnn(sage_db, data, train_edge_index, train_pop, debias_alpha=0.75, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+        ranks_db, aucs_db, aps_db, scores_db, pop_db = evaluate_gnn(sage_db, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+        record_model("GraphSAGE+Debias", ranks_db, aucs_db, aps_db, scores_db, pop_db)
+        
+        # 12. GraphSAGE + IPS
+        ranks_ips, aucs_ips, aps_ips, scores_ips, pop_ips = evaluate_gnn(sage, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=1.0)
+        record_model("GraphSAGE+IPS", ranks_ips, aucs_ips, aps_ips, scores_ips, pop_ips)
+        
+        # 13. Demand Score Original & Revised
+        ranks_demand_orig = []
+        ranks_demand_rev = []
+        
+        for q in queries:
+            p_idx = q[0]
+            c_pos_idx = q[1]
+            cand_list = q[3]
+            
+            rank_orig, _ = demand_score_rank(
+                p_idx, c_pos_idx, cand_list, "original",
+                train_pop, company_last_active, patent_ipc,
+                patent_indegree, ipc4_mean_cit, ipc4_global_mean,
+                power_threshold, STRATEGIC_IPC4,
+                company_patents, cited_by, all_patents_list
+            )
+            ranks_demand_orig.append(rank_orig)
+            
+            rank_rev, _ = demand_score_rank(
+                p_idx, c_pos_idx, cand_list, "revised",
+                train_pop, company_last_active, patent_ipc,
+                patent_indegree, ipc4_mean_cit, ipc4_global_mean,
+                power_threshold, STRATEGIC_IPC4,
+                company_patents, cited_by, all_patents_list
+            )
+            ranks_demand_rev.append(rank_rev)
+            
+        demand_orig_ndcg_seeds.append(aggregate(ranks_demand_orig)["ndcg@10"])
+        demand_rev_ndcg_seeds.append(aggregate(ranks_demand_rev)["ndcg@10"])
+        
+        # Sweeps
+        for beta in betas:
+            ranks_b, _, _, _, _ = evaluate_gnn(sage, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=beta)
+            beta_ndcg_seeds[beta].append(aggregate(ranks_b)["ndcg@10"])
+            
+        for alpha in alphas:
+            sage_db_temp = FullModel('SAGE', 384, 64).to(device)
+            train_gnn(sage_db_temp, data, train_edge_index, train_pop, debias_alpha=alpha, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+            ranks_a, _, _, _, _ = evaluate_gnn(sage_db_temp, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
+            alpha_ndcg_seeds[alpha].append(aggregate(ranks_a)["ndcg@10"])
+            
+    print("\nProcessing results and generating diagnostics...")
+    
+    # 1. Summarize metrics
+    summary_results = {}
+    for m in models:
+        summary_results[m] = {}
+        for k in ["hits@1", "hits@3", "hits@5", "hits@10", "mrr", "ndcg@10", "auc", "ap"]:
+            vals = [s[k] for s in metrics_by_model[m]]
+            summary_results[m][f"{k}_mean"] = float(np.mean(vals))
+            summary_results[m][f"{k}_std"] = float(np.std(vals))
+            
+    # 2. Pairwise Wilcoxon and paired t-test on the 7 specified comparison pairs
+    comparisons = [
+        ('GAT',            'GraphSAGE'),
+        ('GAT+DropEdge',   'GAT'),
+        ('GAT',            'MostPop'),
+        ('GAT',            'SVD'),
+        ('GraphSAGE+Debias', 'GraphSAGE'),
+        ('GraphSAGE+IPS',  'GraphSAGE'),
+        ('GAT+Time',       'GAT'),
+    ]
+    
+    raw_pvals_wilcoxon = []
+    raw_pvals_ttest    = []
+    comparison_labels  = []
+    
+    for (m1, m2) in comparisons:
+        s1 = [s["ndcg@10"] for s in metrics_by_model[m1]]
+        s2 = [s["ndcg@10"] for s in metrics_by_model[m2]]
+        if len(s1) >= 6 and len(s2) >= 6:
+            try:
+                _, p_w = wilcoxon(s1, s2)
+            except Exception:
+                p_w = 1.0
+            try:
+                _, p_t = ttest_rel(s1, s2)
+            except Exception:
+                p_t = 1.0
+        else:
+            p_w, p_t = 1.0, 1.0
+        raw_pvals_wilcoxon.append(p_w)
+        raw_pvals_ttest.append(p_t)
+        comparison_labels.append(f'{m1} vs {m2}')
+        
+    _, adj_pvals_w, _, _ = multipletests(raw_pvals_wilcoxon, method='holm')
+    _, adj_pvals_t, _, _ = multipletests(raw_pvals_ttest,    method='holm')
+    
+    wilcoxon_table = "| Comparison Pair | Wilcoxon Raw p | Wilcoxon Adjusted p (Holm) | t-Test Raw p | t-Test Adjusted p (Holm) |\n"
+    wilcoxon_table += "| :--- | :---: | :---: | :---: | :---: |\n"
+    for idx, label in enumerate(comparison_labels):
+        wilcoxon_table += f"| {label} | {raw_pvals_wilcoxon[idx]:.4e} | {adj_pvals_w[idx]:.4e} | {raw_pvals_ttest[idx]:.4e} | {adj_pvals_t[idx]:.4e} |\n"
+            
+    # 3. GAT Attention Weights (D12)
+    mw_pval = 1.0
+    if gat_attention_weights is not None and len(gat_attention_weights) > 0 and gat_is_hub_edge is not None:
+        alpha_hub = gat_attention_weights[gat_is_hub_edge]
+        alpha_nonhub = gat_attention_weights[~gat_is_hub_edge]
+        if len(alpha_hub) > 0 and len(alpha_nonhub) > 0:
+            mw_stat, mw_pval = mannwhitneyu(alpha_hub, alpha_nonhub, alternative="less")
+            plt.figure(figsize=(6, 4))
+            plt.violinplot([alpha_nonhub, alpha_hub], showmeans=True)
+            plt.xticks([1, 2], ['Non-Hubs', 'Hubs'])
+            plt.ylabel('GAT Attention Weight')
+            plt.title(f'GAT Attention Weights (Hubs vs Non-Hubs)\nMann-Whitney U p-val: {mw_pval:.4e}')
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.artifact_dir, 'gat_attention_violin.png'))
+            plt.close()
+            
+    # 4. Stratified performance (D14)
+    gat_strat_mean = {}
+    gat_strat_std = {}
+    for stratum in ['head', 'torso', 'tail']:
+        ndcg10_vals = [m['ndcg@10'] for m in strata_metrics_by_seed[stratum]]
+        gat_strat_mean[stratum] = float(np.mean(ndcg10_vals)) if ndcg10_vals else 0.0
+        gat_strat_std[stratum] = float(np.std(ndcg10_vals)) if ndcg10_vals else 0.0
+        
+    plt.figure(figsize=(6, 4))
+    x_pos = np.arange(3)
+    plt.bar(x_pos, [gat_strat_mean[s] for s in ['head', 'torso', 'tail']], 
+            yerr=[gat_strat_std[s] for s in ['head', 'torso', 'tail']], 
+            align='center', alpha=0.7, color=['#4285F4', '#EA4335', '#FBBC05'], capsize=10)
+    plt.xticks(x_pos, ['head', 'torso', 'tail'])
+    plt.ylabel('NDCG@10')
+    plt.title('GAT Performance by Popularity Stratum\n(Mean ± Std)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.artifact_dir, 'popularity_stratified.png'))
+    plt.close()
+    
+    # 5. Inversion rate (D15)
+    inversion_rates = {}
+    for m in models:
+        rates = []
+        for seed in SEEDS:
+            queries = test_queries_per_seed[seed]
+            scores_flat = scores_by_model_by_seed[m][seed]
+            rate = compute_inversion_rate(queries, scores_flat, train_pop, pop_thr_q=0.9)
+            rates.append(rate)
+        inversion_rates[m] = {
+            "mean": float(np.mean(rates)),
+            "std": float(np.std(rates))
+        }
+        
+    # 6. Spearman correlation (D13)
+    spearman_summary = {}
+    for m in models:
+        vals = spearman_by_model[m]
+        spearman_summary[m] = {
+            "mean": float(np.mean(vals)),
+            "std": float(np.std(vals))
+        }
+        
+    # Save beta sweep plot
+    plt.figure(figsize=(6, 4))
+    beta_means = [np.mean(beta_ndcg_seeds[b]) for b in betas]
+    beta_stds = [np.std(beta_ndcg_seeds[b]) for b in betas]
+    plt.errorbar(betas, beta_means, yerr=beta_stds, fmt='-o', color='#34A853', capsize=5)
+    plt.xlabel('IPS Penalty Beta')
+    plt.ylabel('NDCG@10')
+    plt.title('GraphSAGE Performance vs IPS Penalty Beta\n(Mean ± Std)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.artifact_dir, 'ips_rerank_sweep.png'))
+    plt.close()
+    
+    # Save alpha sweep plot
+    plt.figure(figsize=(6, 4))
+    alpha_means = [np.mean(alpha_ndcg_seeds[a]) for a in alphas]
+    alpha_stds = [np.std(alpha_ndcg_seeds[a]) for a in alphas]
+    plt.errorbar(alphas, alpha_means, yerr=alpha_stds, fmt='-s', color='#F4B400', capsize=5)
+    plt.xlabel('Debiased Neg Sampling Alpha')
+    plt.ylabel('NDCG@10')
+    plt.title('GraphSAGE Performance vs Debiased Alpha\n(Mean ± Std)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.artifact_dir, 'popularity_debiased_sweep.png'))
+    plt.close()
+    
+    # Build sweep formatting strings
+    beta_sweep_str = ", ".join([f"{b}: {np.mean(beta_ndcg_seeds[b]):.4f}" for b in betas])
+    alpha_sweep_str = ", ".join([f"{a}: {np.mean(alpha_ndcg_seeds[a]):.4f}" for a in alphas])
+    
+    # Demand Score comparison formatting
+    demand_orig_mean = float(np.mean(demand_orig_ndcg_seeds))
+    demand_orig_std = float(np.std(demand_orig_ndcg_seeds))
+    demand_rev_mean = float(np.mean(demand_rev_ndcg_seeds))
+    demand_rev_std = float(np.std(demand_rev_ndcg_seeds))
+    
+    # 8. Output markdown file
+    results_path = os.path.join(args.artifact_dir, "run_ipm_results.md")
+    print(f"Saving results to {results_path}...")
+    
+    # Build Table 4 Markdown Content (Columns: Hits@1, Hits@3, Hits@5, Hits@10, MRR, NDCG@10, AP)
+    table4 = "| Model Architecture | Negative Sampling | Hits@1 | Hits@3 | Hits@5 | Hits@10 | MRR | NDCG@10 | AP |\n"
+    table4 += "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n"
+    for m in models:
+        ns = "Same-IPC Hard"
+        if m in ["MostPop", "Recency"]:
+            ns = "-"
+        elif "Debias" in m:
+            ns = "Pop-Debiased Hard"
+        
+        table4 += f"| {m} | {ns} "
+        for k in ["hits@1", "hits@3", "hits@5", "hits@10", "mrr", "ndcg@10", "ap"]:
+            mean = summary_results[m][f"{k}_mean"]
+            std = summary_results[m][f"{k}_std"]
+            table4 += f"| {mean:.4f} ± {std:.4f} "
+        table4 += "|\n"
+        
+    table4 += "\n*Note: AP equals MRR for single-positive evaluation protocol.*\n"
+        
+    # Build Inversion and Spearman table
+    diag_table = "| Model | Spearman Correlation (ρ) | Hard-Neg Inversion Rate | \n"
+    diag_table += "| :--- | :---: | :---: |\n"
+    for m in models:
+        diag_table += f"| {m} | {spearman_summary[m]['mean']:.4f} ± {spearman_summary[m]['std']:.4f} | {inversion_rates[m]['mean']:.4%} ± {inversion_rates[m]['std']:.4%} |\n"
+        
+    md_content = f"""# IPM Experiment Evaluation & Diagnostics Report
+
+- **Run Mode**: {args.mode} (Seeds: {len(SEEDS)}, Epochs: {max_epochs}, Candidates: {n_neg})
+- **Device**: {device}
+- **Average Candidate Padding Rate**: {avg_padding_rate:.2%}
+- **Cold-Start Statistics (Test Set)**:
+  - Unseen Companies (frac_unseen): {frac_unseen:.2%}
+  - Rare Companies (frac_rare, <= 1 train transfer): {frac_rare:.2%}
+
+## 1. Main Quantitative Results (Table 4)
+
+{table4}
+
+## 2. Popularity Bias & Inversion Rate Diagnostics (Table 5)
+
+{diag_table}
+
+### 2.1 GAT Attention Weight Analysis (D12)
+- Mann-Whitney U test p-value (Hubs vs Non-Hubs attention weight): **{mw_pval:.4e}**
+- Hub vs Non-Hub attention weights violin plot saved at `gat_attention_violin.png`
+
+### 2.2 Stratified NDCG@10 (D14)
+- GAT performance stratified by popularity across seeds (Option b):
+  - **Head**: {gat_strat_mean['head']:.4f} ± {gat_strat_std['head']:.4f}
+  - **Torso**: {gat_strat_mean['torso']:.4f} ± {gat_strat_std['torso']:.4f}
+  - **Tail**: {gat_strat_mean['tail']:.4f} ± {gat_strat_std['tail']:.4f}
+- Stratification bar plot saved at `popularity_stratified.png`
+
+### 2.3 Mitigation Sweeps (B4, B5)
+- IPS Penalty Beta NDCG@10: {{{beta_sweep_str}}}
+- Debiased Negative Sampling Alpha NDCG@10: {{{alpha_sweep_str}}}
+- Plots saved to `ips_rerank_sweep.png` and `popularity_debiased_sweep.png`
+
+## 3. Pairwise Statistical Significance
+
+Holm-Bonferroni corrected pairwise comparisons for NDCG@10:
+
+{wilcoxon_table}
+
+## 4. Demand Score Comparison (E19)
+- **Demand (Original) NDCG@10**: {demand_orig_mean:.4f} ± {demand_orig_std:.4f}
+- **Demand (Revised) NDCG@10**: {demand_rev_mean:.4f} ± {demand_rev_std:.4f}
+"""
+    
+    with open(results_path, "w") as f:
+        f.write(md_content)
+    print("Report generated successfully.")
+
+if __name__ == '__main__':
+    main()

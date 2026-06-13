@@ -1,0 +1,35 @@
+Running in FULL mode (Full dataset, 10 seeds, 50 epochs, 100 hard negatives)...
+Device: mps
+Loading datasets...
+Patents: 370666, Companies: 122519
+Loading SBERT embeddings...
+Precomputing citation structures for Demand Score...
+Building cited_to_citing graph...
+Precomputing unique cites count per company...
+Generating hard negative candidate sets...
+Pre-converting dataframes to NumPy arrays...
+Average candidate padding rate: 1.07%
+
+--- Running Seed 0 ---
+
+--- Running Seed 1 ---
+
+--- Running Seed 2 ---
+
+--- Running Seed 3 ---
+
+--- Running Seed 4 ---
+
+--- Running Seed 5 ---
+
+--- Running Seed 6 ---
+
+--- Running Seed 7 ---
+
+--- Running Seed 8 ---
+
+--- Running Seed 9 ---
+
+Processing results and generating diagnostics...
+Saving results to /Users/isang-won/.gemini/antigravity-ide/brain/f07284b4-b329-432d-aea6-12b660432bcc/run_ipm_results.md...
+Report generated successfully.
