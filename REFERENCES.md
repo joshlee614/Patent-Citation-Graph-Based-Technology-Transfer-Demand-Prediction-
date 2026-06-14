@@ -1,7 +1,8 @@
-# References (검증된 실제 문헌 — 57편)
+# References (검증된 실제 문헌 — 61편)
 
 > 목적: 원고의 인용을 30+로 채우고, **모든 인용이 실재함을 검증**(날조 0건). 웹검색으로 수집 → CrossRef/arXiv/ACL로 존재 검증 → 핵심·불확실 항목은 직접 재검증.
-> 표기: ⚠️=검증 중 메타데이터 정정함, ◆=핵심 인용(반드시 사용 권장), 🇰🇷=한국/KIPRIS 관련.
+> 표기: ⚠️=검증 중 메타데이터 정정함, ◆=핵심 인용(반드시 사용 권장), 🇰🇷=한국/KIPRIS 관련, 📘IPM=대상 저널(*Information Processing & Management*) 게재 — Introduction에 ≥3편 인용해야 함.
+> **📘IPM 게재 논문(검증 완료, 본문 인용처 명시): [58] Abbasiantaeb et al. 2025, [59] Boratto et al. 2021, [60] Boratto et al. 2023, [61] Deldjoo et al. 2021.** 모두 Introduction §1에 인용됨.
 > 인용 스타일은 IPM 최종 시 numbered로 통일하세요. 비-arXiv URL이 브라우저에서 403/418을 내는 것은 출판사 anti-bot일 뿐 실재함(CrossRef로 확인).
 
 ## 검증 메모 (저자 확인 필요 항목)
@@ -31,6 +32,7 @@
 15. Krestel, Chikkamath, Hewel, Risch (2021). *A survey on deep learning for patent analysis.* World Patent Information. https://www.sciencedirect.com/science/article/abs/pii/S017221902100017X
 16. ⚠️🇰🇷 Choi, Lee, Park, Choi (2019). *Deep Patent Landscaping Model Using Transformer and Graph Embedding.* arXiv:1903.05823 (ESWA 2022). https://arxiv.org/abs/1903.05823
 17. Srebrovic, Yonamine (2020). *BERT for Patents (white paper).* Google. https://services.google.com/fh/files/blogs/bert_for_patents_white_paper.pdf
+58. ◆📘IPM Abbasiantaeb, Verberne, Wang (2025). *Tracing science-technology-linkages: A machine learning pipeline for extracting and matching patent in-text references to scientific publications.* Information Processing & Management 62:104264. https://www.sciencedirect.com/science/article/pii/S0306457325002055 — **IPM 특허 인용/참조 마이닝**(특허 in-text 참조 → 과학논문 매칭, EPO+USPTO 1990–2022). 특허 인용 신호가 IPM의 적극적 연구 대상임을 보이는 도메인+저널 정합 인용.
 
 ## C. GNN · 링크 예측
 18. ◆ Hamilton, Ying, Leskovec (2017). *Inductive Representation Learning on Large Graphs (GraphSAGE).* NeurIPS 2017 (arXiv:1706.02216). https://arxiv.org/abs/1706.02216
@@ -63,6 +65,9 @@
 41. Zhu, He, Zhao, Zhang, Wang, Caverlee (2021). *Popularity-Opportunity Bias in Collaborative Filtering.* WSDM 2021. https://dl.acm.org/doi/abs/10.1145/3437963.3441820
 42. Chen, Dong, Wang, Feng, Wang, He (2023). *Bias and Debias in Recommender System: A Survey and Future Directions.* ACM TOIS (arXiv:2010.03240). https://arxiv.org/abs/2010.03240
 43. Klimashevskaia, Jannach, Elahi, Trattner (2024). *A Survey on Popularity Bias in Recommender Systems.* UMUAI (arXiv:2308.01118). https://arxiv.org/abs/2308.01118
+59. ◆📘IPM Boratto, Fenu, Marras (2021). *Connecting user and item perspectives in popularity debiasing for collaborative recommendation.* Information Processing & Management 58(1):102387. https://www.sciencedirect.com/science/article/pii/S0306457320308827 — **IPM 인기편향 디바이싱**(우리 진단의 직접 대응 문헌; 사용자·아이템 양측 관점). DOI 10.1016/j.ipm.2020.102387.
+60. 📘IPM Boratto, Fenu, Marras, Medda (2023). *Practical perspectives of consumer fairness in recommendation.* Information Processing & Management 60(2):103208. https://www.sciencedirect.com/science/article/pii/S0306457322003278 — **IPM 추천 consumer fairness**(편향 완화의 실무적 한계). DOI 10.1016/j.ipm.2022.103208.
+61. ◆📘IPM Deldjoo, Bellogín, Di Noia (2021). *Explaining recommender systems fairness and accuracy through the lens of data characteristics.* Information Processing & Management 58(5):102662. https://www.sciencedirect.com/science/article/pii/S0306457321001503 — **IPM 데이터 특성↔정확도/공정성**(인기편향·cold-start가 데이터 특성의 함수임을 뒷받침). DOI 10.1016/j.ipm.2021.102662.
 
 ## F. 평가 방법론 (sampled metrics · temporal · leakage · hard negatives)
 44. ◆ Krichene, Rendle (2020). *On Sampled Metrics for Item Recommendation.* KDD 2020 (CACM 2022). https://dl.acm.org/doi/10.1145/3394486.3403226
@@ -86,7 +91,8 @@
 
 ## 핵심 인용 사용처 매핑 (요약)
 - **동기/대조 (Intro)**: [2] GAT-NGCF 0.998/0.997 ↔ 우리 현실평가; [50] Dacrema "progress?"; [26] HeaRT; [44] Krichene&Rendle; [47] Meng; [48] Ji(leakage); [52] Hidasi&Czapp(tie-break).
+- **📘IPM 인용 (Introduction §1, ≥3편 요건 충족 — 총 4편)**: [58] Abbasiantaeb et al. 2025(특허 인용/참조 마이닝, §1 ¶2 "Patents cite other patents"), [59] Boratto et al. 2021(인기편향 디바이싱, §1 ¶3), [61] Deldjoo et al. 2021(데이터 특성↔정확도/공정성, §1 ¶3), [60] Boratto et al. 2023(consumer fairness, §1 ¶3·§6 완화 한계). Related Work §2.1/§2.3에서도 재인용.
 - **방법(우리 모델)**: [18] GraphSAGE, [19] GAT, [20] GATv2, [27] LightGCN, [28] NGCF, [31] BPR, [33] MF/SVD, [54][55] SBERT.
-- **인기편향(RQ2)**: [39][40][41][42][43] popularity bias; [36][37] IPS; [38] logQ.
-- **특허 도메인**: [1][3][4][5][6][7][8] transfer/recommendation; [9–17] mining/embeddings.
+- **인기편향(RQ2)**: [39][40][41][42][43] popularity bias; [59][60][61] IPM 인기편향/공정성; [36][37] IPS; [38] logQ.
+- **특허 도메인**: [1][3][4][5][6][7][8] transfer/recommendation; [9–17][58] mining/embeddings/citation.
 - **cold-start**: [35] DropoutNet; [55] multilingual SBERT(content features).
