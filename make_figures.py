@@ -13,7 +13,13 @@ from matplotlib.patches import Patch
 OUT = "paper_figures"
 os.makedirs(OUT, exist_ok=True)
 plt.rcParams.update({"font.size": 10, "axes.grid": True, "grid.alpha": 0.3,
-                     "figure.dpi": 300, "savefig.dpi": 300, "savefig.bbox": "tight"})
+                     "figure.dpi": 300, "savefig.dpi": 300, "savefig.bbox": "tight",
+                     # Times New Roman body to match the manuscript; STIX for math
+                     # (Times-compatible) so Greek symbols (rho, alpha, beta) render in serif.
+                     "font.family": "serif",
+                     "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"],
+                     "mathtext.fontset": "stix",
+                     "pdf.fonttype": 42, "ps.fonttype": 42})  # embed TrueType (editable text)
 
 
 def _save(fig, name, fignum):
