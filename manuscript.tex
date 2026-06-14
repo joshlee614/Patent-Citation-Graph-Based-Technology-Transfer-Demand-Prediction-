@@ -216,7 +216,34 @@ retrieval (e.g., Recall@5\,=\,0.998 \cite{kim2025}) under random-split, sampled-
 evaluation --- precisely the regime our protocol revisits. Three properties
 distinguish our setting: the supervision is a \emph{realized} transfer; the
 prediction is prospective; and the patent side is severely cold-start (91.7\% of test
-patents are new).
+patents are new). Table~\ref{tab:protocol} contrasts the evaluation safeguards our
+protocol applies with those prevailing in prior graph-based patent recommenders.
+
+\begin{table}[t]
+\centering
+\caption{Evaluation safeguards in the protocol of this paper versus those typically
+applied in prior graph-based patent-recommendation studies (e.g.,
+\cite{kim2025,chendeng2023,liu2024}). ``Typical'' denotes the prevailing practice, not
+any single paper. Each safeguard counters a specific source of optimism (future
+leakage, easy negatives, tie degeneracy, an absent skyline, hidden cold-start, or a
+single arbitrary cutoff).}
+\label{tab:protocol}
+\begin{tabular}{lcc}
+\toprule
+Evaluation safeguard & Typical prior eval & This work \\
+\midrule
+Temporal (forward-in-time) split            & usually random   & yes \\
+Hard negatives from the same IPC class       & uniform / in-batch & yes \\
+Average-rank tie-break                        & unspecified      & yes \\
+Popularity skyline as the bar to beat         & weak / absent    & yes \\
+Cold-start fraction reported and decomposed   & rarely           & yes \\
+AUC reported beside top-$K$                    & top-$K$ only     & yes \\
+Unsampled full-IPC-pool metric                & no               & yes \\
+Rolling-origin (multiple temporal cutoffs)     & no               & yes \\
+Multi-seed, paired tests, multiplicity control & rare             & yes \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{GNNs for Link Prediction and Recommendation}
 GraphSAGE \cite{hamilton2017} introduced inductive aggregation; GAT \cite{velickovic2018}
