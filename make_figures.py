@@ -1,8 +1,9 @@
 """
 make_figures.py — Publication figures for the paper, generated from the FINAL
-10-seed (average-rank tie-break) results. Numbers are transcribed from
-ipm_results_final/run_ipm_results.md and are kept here so the figures are
-reproducible without the Drive artifacts. Output: ./paper_figures/*.png
+10-seed (average-rank tie-break) results on a single NVIDIA T4 / Apple-Silicon CPU.
+Numbers are transcribed from run_ipm_results_temporal.md (temporal/main) and
+run_ipm_results_random.md (RQ1 contrast) so the figures are reproducible without
+the run artifacts. Output: ./paper_figures/*.png
 """
 import os
 import numpy as np
@@ -13,34 +14,37 @@ OUT = "paper_figures"
 os.makedirs(OUT, exist_ok=True)
 plt.rcParams.update({"font.size": 10, "axes.grid": True, "grid.alpha": 0.3, "figure.dpi": 200})
 
-# (model, ndcg10, ndcg_std, auc, group)  — group: pop, mf/cf, text, gnn, mit
+# (model, ndcg10, ndcg_std, auc, group)  — group: pop, cf, text, gnn, mit
+# TEMPORAL split, 10 seeds (run_ipm_results_temporal.md §1).
 TABLE4 = [
     ("MostPop", 0.1968, 0.0000, 0.5826, "pop"),
     ("MostPop-IPC", 0.1990, 0.0000, 0.4158, "pop"),
     ("Recency", 0.1488, 0.0000, 0.6022, "pop"),
+    ("CN", 0.0654, 0.0000, 0.5341, "cf"),
+    ("AA", 0.0655, 0.0000, 0.5341, "cf"),
     ("SVD", 0.0366, 0.0000, 0.5197, "cf"),
-    ("MLP", 0.1502, 0.0041, 0.5760, "text"),
+    ("MLP", 0.1503, 0.0071, 0.5738, "text"),
     ("LightGCN", 0.0578, 0.0005, 0.5090, "cf"),
-    ("NGCF", 0.1964, 0.0003, 0.5836, "cf"),
-    ("GraphSAGE", 0.0961, 0.0523, 0.4817, "gnn"),
-    ("GAT", 0.0720, 0.0110, 0.5159, "gnn"),
-    ("GraphSAGE+Debias", 0.0750, 0.0393, 0.4914, "mit"),
-    ("GraphSAGE+logQ", 0.1352, 0.0350, 0.5463, "mit"),
-    ("GraphSAGE+DropEdge", 0.1142, 0.0462, 0.4861, "mit"),
-    ("GraphSAGE+Time", 0.1060, 0.0483, 0.4912, "mit"),
-    ("GraphSAGE+IPS", 0.1277, 0.0224, 0.4296, "mit"),
-    ("GAT+Debias", 0.0627, 0.0233, 0.5088, "mit"),
-    ("GAT+logQ", 0.1068, 0.0012, 0.5497, "mit"),
-    ("GAT+DropEdge", 0.0709, 0.0142, 0.5161, "mit"),
-    ("GAT+Time", 0.0740, 0.0154, 0.5155, "mit"),
-    ("GAT+IPS", 0.1571, 0.0007, 0.4174, "mit"),
-    ("GraphSAGE+Debias+IPS", 0.1550, 0.0053, 0.4171, "mit"),
-    ("GraphSAGE+Time+IPS", 0.1285, 0.0256, 0.4351, "mit"),
-    ("GAT+Debias+IPS", 0.1574, 0.0003, 0.4174, "mit"),
-    ("GAT+Time+IPS", 0.1554, 0.0055, 0.4172, "mit"),
+    ("NGCF", 0.1964, 0.0002, 0.5835, "cf"),
+    ("GraphSAGE", 0.0840, 0.0433, 0.4729, "gnn"),
+    ("GAT", 0.0736, 0.0058, 0.5189, "gnn"),
+    ("GraphSAGE+Debias", 0.1002, 0.0584, 0.5123, "mit"),
+    ("GraphSAGE+logQ", 0.1251, 0.0428, 0.5396, "mit"),
+    ("GraphSAGE+DropEdge", 0.0965, 0.0519, 0.4851, "mit"),
+    ("GraphSAGE+Time", 0.1182, 0.0453, 0.4958, "mit"),
+    ("GraphSAGE+IPS", 0.1321, 0.0258, 0.4216, "mit"),
+    ("GAT+Debias", 0.0727, 0.0189, 0.5149, "mit"),
+    ("GAT+logQ", 0.1069, 0.0009, 0.5481, "mit"),
+    ("GAT+DropEdge", 0.0773, 0.0083, 0.5185, "mit"),
+    ("GAT+Time", 0.0852, 0.0042, 0.5214, "mit"),
+    ("GAT+IPS", 0.1573, 0.0003, 0.4174, "mit"),
+    ("GraphSAGE+Debias+IPS", 0.1581, 0.0005, 0.4173, "mit"),
+    ("GraphSAGE+Time+IPS", 0.1277, 0.0236, 0.4274, "mit"),
+    ("GAT+Debias+IPS", 0.1571, 0.0002, 0.4173, "mit"),
+    ("GAT+Time+IPS", 0.1573, 0.0002, 0.4174, "mit"),
 ]
 GROUP_COLOR = {"pop": "#888888", "cf": "#4477AA", "text": "#66CCEE", "gnn": "#EE6677", "mit": "#CCBB44"}
-GROUP_LABEL = {"pop": "Popularity/Recency", "cf": "MF / CF", "text": "Text MLP", "gnn": "GNN", "mit": "Mitigation"}
+GROUP_LABEL = {"pop": "Popularity/Recency", "cf": "MF / CF / structural", "text": "Text MLP", "gnn": "GNN", "mit": "Mitigation"}
 MOSTPOP = 0.1968
 
 
@@ -53,7 +57,7 @@ def fig1_main():
     colors = [GROUP_COLOR[r[4]] for r in rows]
     y = np.arange(len(rows))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 8), sharey=True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 8.5), sharey=True)
     ax1.barh(y, ndcg, xerr=err, color=colors, capsize=2, edgecolor="white", linewidth=0.4)
     ax1.axvline(MOSTPOP, color="black", ls="--", lw=1)
     ax1.text(MOSTPOP, len(rows) - 0.3, " MostPop 0.197", fontsize=8, va="top")
@@ -91,21 +95,19 @@ def fig2_tiebreak():
 
 
 def fig3_popbias():
-    # (model, spearman, inversion%, ndcg)
+    # (model, spearman, inversion%, ndcg)  — temporal, run_ipm_results_temporal.md §2
     rows = [
         ("MostPop", 1.00, 56.4, 0.197), ("NGCF", 0.96, 56.3, 0.196), ("Recency", 0.69, 50.0, 0.149),
-        ("MLP", 0.19, 18.7, 0.150), ("GraphSAGE", 0.07, 49.8, 0.096), ("SVD", 0.02, 2.4, 0.037),
-        ("GAT", -0.05, 28.3, 0.072),
+        ("MLP", 0.19, 19.0, 0.150), ("GraphSAGE", 0.07, 51.5, 0.084), ("SVD", 0.02, 2.4, 0.037),
+        ("GAT", -0.05, 28.4, 0.074),
     ]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
-    # (a) Spearman rho vs NDCG scatter
     for m, rho, inv, nd in rows:
         ax1.scatter(rho, nd, s=60, color="#4477AA")
         ax1.annotate(m, (rho, nd), fontsize=8, xytext=(4, 4), textcoords="offset points")
     ax1.axhline(MOSTPOP, color="gray", ls="--", lw=1); ax1.text(-0.05, MOSTPOP, " MostPop", fontsize=7, va="bottom")
     ax1.set_xlabel("Spearman ρ (score vs train popularity)"); ax1.set_ylabel("NDCG@10")
     ax1.set_title("(a) Popularity correlation does not buy accuracy")
-    # (b) inversion rate bar
     names = [r[0] for r in rows]; inv = [r[2] for r in rows]
     yb = np.arange(len(rows))
     ax2.barh(yb, inv, color="#CCBB44")
@@ -118,7 +120,7 @@ def fig3_popbias():
 
 def fig4_stratified():
     strata = ["Head\n(popular)", "Torso", "Tail/new\n(unpopular)"]
-    vals = [0.0161, 0.0818, 0.3551]; errs = [0.0021, 0.0045, 0.0746]
+    vals = [0.0164, 0.0821, 0.3705]; errs = [0.0024, 0.0063, 0.0391]
     fig, ax = plt.subplots(figsize=(5.5, 4))
     ax.bar(strata, vals, yerr=errs, capsize=5, color=["#EE6677", "#CCBB44", "#4477AA"])
     for i, v in enumerate(vals): ax.text(i, v + 0.01, f"{v:.3f}", ha="center", fontsize=9)
@@ -129,8 +131,8 @@ def fig4_stratified():
 
 def fig5_coldstart():
     models = ["SVD", "GAT", "GraphSAGE", "MostPop"]
-    newp = [0.000, 0.021, 0.107, 0.212]
-    seenp = [0.439, 0.021, 0.129, 0.324]
+    newp = [0.000, 0.0215, 0.0954, 0.2120]   # new-patent & seen-company subset
+    seenp = [0.4391, 0.0205, 0.0915, 0.3238]  # seen-patent subset
     x = np.arange(len(models)); w = 0.38
     fig, ax = plt.subplots(figsize=(6.5, 4))
     ax.bar(x - w / 2, newp, w, label="New patent (91.7% of test)", color="#EE6677")
@@ -145,7 +147,7 @@ def fig5_coldstart():
 
 def fig6_error():
     models = ["GraphSAGE", "GAT"]
-    popular = [98.5, 57.8]; rare = [0.2, 8.3]; resid = [1.3, 33.9]
+    popular = [98.8, 57.8]; rare = [0.1, 8.3]; resid = [1.1, 33.9]
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.bar(models, popular, label="Lost to popular hard-negative", color="#EE6677")
     ax.bar(models, rare, bottom=popular, label="Rare / new positive", color="#CCBB44")
@@ -159,9 +161,9 @@ def fig6_error():
 
 def fig7_sweeps():
     betas = [0.0, 0.5, 1.0, 2.0, 4.0]
-    ips = {"GraphSAGE": [0.0961, 0.1181, 0.1277, 0.1473, 0.1565], "GAT": [0.0720, 0.1515, 0.1571, 0.1573, 0.1573]}
+    ips = {"GraphSAGE": [0.0840, 0.1175, 0.1321, 0.1483, 0.1567], "GAT": [0.0736, 0.1496, 0.1573, 0.1573, 0.1573]}
     alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
-    deb = {"GraphSAGE": [0.1358, 0.0845, 0.0868, 0.1073, 0.1293], "GAT": [0.0775, 0.0634, 0.0540, 0.0615, 0.0567]}
+    deb = {"GraphSAGE": [0.0991, 0.0883, 0.0623, 0.1054, 0.1015], "GAT": [0.0800, 0.0612, 0.0601, 0.0625, 0.0817]}
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
     for m, c in [("GraphSAGE", "#4477AA"), ("GAT", "#EE6677")]:
         ax1.plot(betas, ips[m], "-o", color=c, label=m)
@@ -175,15 +177,41 @@ def fig7_sweeps():
     fig.tight_layout(rect=(0, 0, 1, 0.95)); fig.savefig(f"{OUT}/fig7_mitigation_sweeps.png"); plt.close(fig)
 
 
+def fig8_rq1_split():
+    """RQ1: temporal vs random split. A random split suppresses cold-start (91.7%->2.4%)
+    and turns SVD into the apparent winner — the opposite of the temporal verdict."""
+    models = ["MostPop", "SVD", "GAT"]
+    temp_ndcg = [0.1968, 0.0366, 0.0736]; rand_ndcg = [0.2192, 0.4420, 0.1648]
+    temp_auc = [0.5826, 0.5197, 0.5189]; rand_auc = [0.6669, 0.8297, 0.6502]
+    x = np.arange(len(models)); w = 0.38
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.2))
+    ax1.bar(x - w / 2, temp_ndcg, w, label="Temporal (realistic)", color="#4477AA")
+    ax1.bar(x + w / 2, rand_ndcg, w, label="Random (leaky)", color="#EE6677")
+    ax1.axhline(MOSTPOP, color="gray", ls="--", lw=1)
+    for i, v in enumerate(temp_ndcg): ax1.text(i - w / 2, v + 0.005, f"{v:.3f}", ha="center", fontsize=8)
+    for i, v in enumerate(rand_ndcg): ax1.text(i + w / 2, v + 0.005, f"{v:.3f}", ha="center", fontsize=8)
+    ax1.set_xticks(x); ax1.set_xticklabels(models); ax1.set_ylabel("NDCG@10")
+    ax1.set_title("(a) NDCG@10: SVD wins only under a random split"); ax1.legend(fontsize=8)
+
+    ax2.bar(x - w / 2, temp_auc, w, label="Temporal", color="#4477AA")
+    ax2.bar(x + w / 2, rand_auc, w, label="Random", color="#EE6677")
+    ax2.axhline(0.5, color="gray", ls="--", lw=1)
+    for i, v in enumerate(temp_auc): ax2.text(i - w / 2, v + 0.008, f"{v:.2f}", ha="center", fontsize=8)
+    for i, v in enumerate(rand_auc): ax2.text(i + w / 2, v + 0.008, f"{v:.2f}", ha="center", fontsize=8)
+    ax2.set_xticks(x); ax2.set_xticklabels(models); ax2.set_ylabel("AUC"); ax2.set_ylim(0.4, 0.9)
+    ax2.set_title("(b) AUC inflates under a random split"); ax2.legend(fontsize=8)
+    fig.suptitle("RQ1: a random split lowers cold-start 91.7%→2.4% and reverses the verdict", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.95)); fig.savefig(f"{OUT}/fig8_split_contrast.png"); plt.close(fig)
+
+
 def fig0_pipeline():
     from matplotlib.patches import FancyBboxPatch, Circle, FancyArrowPatch
     fig, (axA, axB) = plt.subplots(1, 2, figsize=(12, 4.2), gridspec_kw={"width_ratios": [1, 1.5]})
 
-    # (a) heterogeneous graph schema
     axA.set_xlim(0, 10); axA.set_ylim(0, 10); axA.axis("off")
     axA.set_title("(a) Heterogeneous graph", fontsize=11)
-    pat = [(2, 7.5), (2, 4.5)]           # patent nodes
-    comp = [(7.5, 8), (7.5, 5.5), (7.5, 3)]  # company nodes
+    pat = [(2, 7.5), (2, 4.5)]
+    comp = [(7.5, 8), (7.5, 5.5), (7.5, 3)]
     for (x, y) in pat:
         axA.add_patch(Circle((x, y), 0.7, color="#4477AA", zorder=3))
         axA.text(x, y, "P", color="white", ha="center", va="center", fontsize=11, zorder=4)
@@ -191,11 +219,9 @@ def fig0_pipeline():
         axA.add_patch(FancyBboxPatch((x - 0.6, y - 0.5), 1.2, 1.0, boxstyle="round,pad=0.02",
                                      color="#EE6677", zorder=3))
         axA.text(x, y, "C", color="white", ha="center", va="center", fontsize=11, zorder=4)
-    # citation edge (patent-patent)
     axA.add_patch(FancyArrowPatch(pat[0], pat[1], arrowstyle="-|>", color="#888888",
                                   mutation_scale=14, lw=1.6, shrinkA=18, shrinkB=18))
     axA.text(1.1, 6.0, "cites", color="#555555", fontsize=8, rotation=90)
-    # transfer edges (patent-company)
     for (px, py) in pat:
         for (cx, cy) in comp:
             axA.add_patch(FancyArrowPatch((px, py), (cx, cy), arrowstyle="-|>", color="#CC8844",
@@ -204,7 +230,6 @@ def fig0_pipeline():
     axA.text(2, 9.2, "Patent (frozen SBERT)", ha="center", fontsize=8.5, color="#4477AA")
     axA.text(7.5, 9.6, "Company", ha="center", fontsize=8.5, color="#EE6677")
 
-    # (b) evaluation pipeline
     axB.set_xlim(0, 16); axB.set_ylim(0, 6); axB.axis("off")
     axB.set_title("(b) Leakage-free evaluation pipeline", fontsize=11)
     steps = [
@@ -231,7 +256,7 @@ def fig0_pipeline():
 if __name__ == "__main__":
     fig0_pipeline()
     fig1_main(); fig2_tiebreak(); fig3_popbias(); fig4_stratified()
-    fig5_coldstart(); fig6_error(); fig7_sweeps()
+    fig5_coldstart(); fig6_error(); fig7_sweeps(); fig8_rq1_split()
     print("Figures written to", OUT + "/:")
     for f in sorted(os.listdir(OUT)):
         print("  ", f)
