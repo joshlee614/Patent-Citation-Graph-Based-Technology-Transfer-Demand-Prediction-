@@ -219,6 +219,19 @@ def aggregate(rank_list, ks=KS):
     keys = metrics[0].keys()
     return {k: float(np.mean([m[k] for m in metrics])) for k in keys}
 
+def tie_aware_ranks(scores):
+    """1-indexed rank of the positive (column 0) among candidates, using the AVERAGE-RANK
+    convention for ties. A no-information model that assigns all candidates the SAME score
+    must land at the middle rank (i.e. chance) — NOT rank 1. The previous strict-'>' rule
+    placed the positive above every tied negative, which handed a *perfect* score to, e.g.,
+    SVD on cold-start patents (whose latent factor is 0 -> all scores 0 -> all tied). This
+    convention is consistent with the tie=0.5 AUC and yields rank = #(neg>pos) + 0.5*#(neg==pos) + 1.
+    """
+    pos = scores[:, 0:1]
+    gt = (scores[:, 1:] > pos).sum(dim=-1)
+    eq = (scores[:, 1:] == pos).sum(dim=-1)
+    return gt + 0.5 * eq + 1
+
 def aggregate_with_n(rank_list, ks=KS):
     """aggregate() but tolerant of empty input and carrying the query count n."""
     if len(rank_list) == 0:
@@ -260,7 +273,7 @@ def evaluate_mostpop_ipc(queries, ipc_company_count, train_pop):
         counts = ipc_company_count.get(ipc4, {})
         s = np.array([counts.get(int(c), 0) for c in cand], dtype=float)
         pos, neg = s[0], s[1:]
-        rank = int((neg > pos).sum()) + 1
+        rank = float((neg > pos).sum()) + 0.5 * float((neg == pos).sum()) + 1  # average-rank ties
         if len(neg) > 0:
             auc = float(((pos > neg).astype(float) + 0.5 * (pos == neg).astype(float)).mean())
         else:
@@ -382,7 +395,7 @@ def compute_ndcg_from_embeddings(hp, hc, p_t, cand_t, batch_size=10000):
         hp_q = hp[batch_p]
         hc_q = hc[batch_cand]
         scores = torch.bmm(hc_q, hp_q.unsqueeze(-1)).squeeze(-1)
-        ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
+        ranks = tie_aware_ranks(scores)
         ndcg = 1.0 / torch.log2(ranks.float() + 1.0)
         ndcg[ranks > 10] = 0.0
         ndcgs.append(ndcg.cpu())
@@ -563,7 +576,7 @@ def evaluate_embeddings(hp, hc, test_p_t, test_cand_t, train_pop_t, ips_beta=0.0
             pen = ips_beta * torch.log(train_pop_t[batch_cand] + 1.0)
             scores = scores - pen
             
-        ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
+        ranks = tie_aware_ranks(scores)
         # True rank-AUC for a single positive: P(pos>neg) + 0.5*P(pos==neg), averaged
         # over the candidate negatives. Ties contribute 0.5 (matches sklearn roc_auc_score),
         # unlike the previous strict-'>' version which mislabeled a tie-pessimistic statistic as AUC.
@@ -603,7 +616,7 @@ def evaluate_cf_model(model, norm_adj, test_p_t, test_cand_t, device, train_pop_
 
 def evaluate_mostpop(test_cand_t, train_pop_t):
     scores = train_pop_t[test_cand_t].float()
-    ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
+    ranks = tie_aware_ranks(scores)
     aucs = ((scores[:, 0:1] > scores[:, 1:]).float()
             + 0.5 * (scores[:, 0:1] == scores[:, 1:]).float()).mean(dim=-1)
     aps = 1.0 / ranks.float()
@@ -617,7 +630,7 @@ def evaluate_mostpop(test_cand_t, train_pop_t):
 
 def evaluate_recency(test_cand_t, company_last_active_t, train_pop_t):
     scores = company_last_active_t[test_cand_t].float()
-    ranks = (scores[:, 1:] > scores[:, 0:1]).sum(dim=-1) + 1
+    ranks = tie_aware_ranks(scores)
     aucs = ((scores[:, 0:1] > scores[:, 1:]).float()
             + 0.5 * (scores[:, 0:1] == scores[:, 1:]).float()).mean(dim=-1)
     aps = 1.0 / ranks.float()

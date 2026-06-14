@@ -3,7 +3,18 @@ These do NOT need the real dataset — they verify the new low-cost diagnostics
 (NEW-1/2/3/4/9/12) logic on tiny synthetic inputs. Run: python tests_new_logic.py
 """
 import numpy as np
+import torch
 import run_ipm_experiment as R
+
+
+def test_tie_aware_ranks():
+    # all candidates tied (no-information model) -> MIDDLE rank, not 1 (the SVD cold-start bug)
+    s = torch.zeros(2, 5)                         # 2 queries, 1 positive + 4 negatives, all equal
+    assert torch.allclose(R.tie_aware_ranks(s), torch.tensor([3.0, 3.0]))   # 0 + 0.5*4 + 1 = 3
+    assert R.tie_aware_ranks(torch.tensor([[1., 0., 0., 0.]])).item() == 1.0   # strictly best
+    assert R.tie_aware_ranks(torch.tensor([[0., 1., 1., 1.]])).item() == 4.0   # strictly worst
+    assert R.tie_aware_ranks(torch.tensor([[.5, .5, .1, .1]])).item() == 1.5   # one tie -> 1.5
+    print("  test_tie_aware_ranks OK")
 
 
 def approx(a, b, tol=1e-9):
@@ -78,6 +89,7 @@ def test_classify_failures():
 
 
 if __name__ == "__main__":
+    test_tie_aware_ranks()
     test_aggregate_with_n()
     test_bootstrap_ci()
     test_mostpop_ipc()
