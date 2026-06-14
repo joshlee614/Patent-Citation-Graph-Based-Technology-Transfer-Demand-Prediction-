@@ -539,3 +539,52 @@ The contributions of this work are therefore diagnostic rather than a claim of m
 - **Chance floor 명시**: random ranking 기준 NDCG@10 ≈ 0.045, AUC = 0.5를 결과표 각주로. (무정보=동점→average-rank rank 51 → NDCG 0이 chance보다도 낮은 이유까지 한 문장.)
 - **효과크기**: p값과 함께 평균 NDCG@10 차이(Δ) 보고. 이미 표에 mean±std 있으니 Δ만 명시.
 - **"below popularity" 격차의 bootstrap CI**: GAT−MostPop 등 핵심 격차에 쿼리 bootstrap CI(코드의 ranks 저장 활용) — §10 부트스트랩을 모델쌍 차이로 확장 가능.
+
+## P7. Positioning Table — what our protocol controls that prior patent-recommendation evaluations do not
+
+**기존:** (없음 — 우리 기여가 "방법 우월"이 아니라 "평가 프로토콜+진단"임을 한눈에 보이는 표가 없음)
+
+**수정 제안 (Related Work 또는 Methodology 도입부에 Table로):**
+
+> The methodological gap our protocol closes is best seen by tabulating which evaluation safeguards prior patent-recommendation studies apply. Reported near-perfect retrieval (e.g., Recall@5 = 0.998 [Kim et al., 2025]) co-occurs with random splitting and uniform/sampled negatives — exactly the conditions our protocol shows to be optimistic.
+
+| Evaluation safeguard | Typical prior patent-rec eval (e.g., [Kim et al., 2025]) | This work |
+| :-- | :--: | :--: |
+| Temporal (forward-in-time) split | usually random | **yes** (by transfer registration date) |
+| Hard negatives from same technology class | uniform / in-batch | **yes** (same 4-digit IPC) |
+| Average-rank tie-break (no-info → chance) | unspecified (strict `>` common) | **yes** (artifact removed) |
+| Popularity skyline as the bar (global + class-conditional) | weak / absent | **yes** (MostPop, MostPop-IPC) |
+| Cold-start fraction reported & decomposed | rarely | **yes** (91.7% unseen patents) |
+| AUC reported beside top-K (degeneracy check) | top-K only | **yes** (AUC≈chance flag) |
+| Unsampled full-pool ranking (sampled-metric defense) | no | **yes** (`--full_pool`, §12 / P9) |
+| Rolling-origin / multiple temporal cutoffs | no | proposed robustness (Future Work) |
+| Multi-seed + paired tests + multiple-comparison correction | rare | **yes** (10 seeds, Wilcoxon+Holm) |
+
+**근거:** IPM 리뷰어가 "왜 선행연구 0.998인데 너희는 붕괴하나"를 가장 먼저 물음 → **평가 통제 항목별 대조표**가 가장 강한 한 장. `[Kim et al., 2025]` 열은 "typical/usually"로 표기(개별 논문 단정 회피, 관행 대조). full-pool 행은 **구현 완료**(P9·`--full_pool`); rolling-origin은 미구현이므로 정직하게 *Future Work*로 표기(과장 금지).
+
+## P9. Unsampled full-IPC-pool ranking — implemented (`--full_pool`)
+
+**기존:** (없음 — sampled top-K만 보고. 리뷰어가 "sampled metric은 모델 순위를 왜곡할 수 있다 [Krichene & Rendle, 2020]. unsampled로도 보여라"를 거의 확실히 요구)
+
+**수정 제안 (Methodology 평가절 + Results §12 표):**
+> As an unsampled robustness check we additionally rank each held-out positive against the **entire** eligible same-IPC company pool — every company that transferred a same-IPC patent in training and did not receive the query patent — with no negative sampling. This is the unsampled counterpart of the n_neg = 100 metric and directly addresses the concern that sampled top-K metrics can misrank models [Krichene & Rendle, 2020]. Tie-breaking is again average-rank. `[full-pool 결과로 확정: 학습모델이 full-pool에서도 MostPop을 넘지 못함을 §12 표로]`
+
+**구현/실행 (검증 완료):**
+- 신규 순수함수 `full_pool_ranks(test_list, ipc_company_index, train_transfer_set, score_fn, max_pool, seed)` — build_candidates의 적격성(동일-IPC ∧ 미수령)을 그대로 모사, average-rank 타이브레이크, `max_pool` 초과 풀만 down-cap(비율 보고). 단위테스트 `test_full_pool_ranks`(배제·타이·skip·cap) 통과.
+- 시드 0, 재학습 없이 이미 학습된 GraphSAGE/GAT 임베딩 + SVD 인수 + MostPop 인기수로 채점.
+- 실행: 기존 명령에 `--full_pool` 추가(예: `--mode full --split temporal --full_pool`). 결과는 `run_ipm_results.md` **§12** 표(sampled n_neg=100 vs full-pool NDCG@10/Hits@10/MRR, 평균 풀 크기·cap·skip 메타 포함).
+- mock smoke 검증: §12 표 정상 생성, 모델 순서 보존.
+
+**근거:** sampled-metric 비판은 IPM 추천/IR 심사 1순위 방어 항목. nneg_sweep(50/100/200)에 더해 **완전 비샘플 풀**까지 보고하면 "샘플링 때문에 진 것" 반박을 원천 차단. 코드·테스트 모두 검증 완료(날조 없음).
+
+## P8. "AUC near chance is not a contradiction" — interpretation & statistical-conclusion note
+
+**기존:** (없음 — NDCG>chance인데 AUC≈0.5인 조합을 리뷰어가 "버그 아니냐"고 오해할 수 있음)
+
+**수정 제안 (Results 해석 단락 + 결과표 각주):**
+
+> A model can show top-K metrics above the random floor while reporting AUC near 0.5, and the two are not in contradiction. NDCG@K rewards placing the single positive near the top of a *same-IPC* candidate list, whereas AUC measures *global* separability of all positive vs. negative pairs; a model that ranks by company popularity will occasionally float the positive up the list (lifting NDCG above the 0.045 random floor) while ordering pairs essentially at chance globally (AUC ≈ 0.5). We therefore read **AUC ≈ chance alongside above-floor NDCG as the signature of a popularity prior, not a learned relevance signal** — which the score–popularity correlation (ρ up to 1.0) and the 56% hard-negative inversion rate independently confirm. For reference, the random-ranking floors under our protocol are NDCG@10 ≈ 0.045 and AUC = 0.5; an all-tied no-information model lands at average rank (n_neg+1)/2 ≈ 50.5, i.e. *below* the random-ranking NDCG floor, which is precisely why the strict-`>` tie-break (which instead places it first) inflates so severely.
+
+> *Statistical-conclusion validity.* With ten seeds we report paired Wilcoxon signed-rank tests with Holm–Bonferroni correction over the pre-registered comparison family, and bootstrap 95% CIs over the ~220k test queries; we report metric differences (effect sizes) beside adjusted p-values so that a statistically significant but practically negligible gain (e.g. logQ's +0.035 NDCG@10 on GAT, still below MostPop) is not over-read.
+
+**근거:** "AUC 0.5인데 NDCG는 floor 위" 조합은 리뷰어 오해 1순위 → metric이 측정하는 대상(국소 top-K vs 전역 분리도)이 다름을 명시하고, 그 조합 자체를 *popularity prior의 지문*으로 해석(ρ=1.0·inversion 56%로 교차검증). chance-floor 수치는 P6과 일치.

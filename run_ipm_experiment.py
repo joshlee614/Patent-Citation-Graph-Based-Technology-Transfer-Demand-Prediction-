@@ -250,6 +250,40 @@ def aggregate_with_n(rank_list, ks=KS):
     out["n"] = len(rank_list)
     return out
 
+def full_pool_ranks(test_list, ipc_company_index, train_transfer_set, score_fn,
+                    max_pool=1000, seed=0):
+    """UNSAMPLED same-IPC full-pool ranking (sampled-metric defense, A2/E18b).
+
+    For each test (patent p, positive company c_pos, ipc4), rank c_pos against the ENTIRE
+    eligible same-IPC pool — every company that transferred a same-IPC patent in TRAIN and
+    did NOT receive p — with NO negative sampling. This is the unsampled counterpart to the
+    n_neg=100 sampled metric and directly answers the Krichene & Rendle (2020) concern that
+    sampled top-K metrics can misrank models. Pools larger than `max_pool` are randomly
+    down-capped (counted in n_capped) only to bound memory; with a large cap the metric is
+    effectively unsampled. Queries with no eligible same-IPC negative are skipped (n_skipped).
+
+    score_fn(p_idx, ipc4, comp_idx_np) -> np.ndarray aligned to comp_idx_np (higher = better).
+    Tie-breaking is average-rank, identical to tie_aware_ranks(): rank = #(neg>pos) + 0.5*#(neg==pos) + 1.
+    Returns (ranks_list, pool_sizes, n_capped, n_skipped).
+    """
+    rng = np.random.default_rng(seed)
+    ranks, pool_sizes, n_capped, n_skipped = [], [], 0, 0
+    for p, c_pos, ipc4 in test_list:
+        pool = [c for c in (ipc_company_index.get(ipc4, set()) - {c_pos})
+                if (p, c) not in train_transfer_set]
+        if len(pool) == 0:
+            n_skipped += 1            # undefined ranking with zero negatives
+            continue
+        if len(pool) > max_pool:
+            pool = rng.choice(np.asarray(pool, dtype=np.int64), size=max_pool, replace=False).tolist()
+            n_capped += 1
+        comp = np.asarray([c_pos] + pool, dtype=np.int64)
+        s = np.asarray(score_fn(p, ipc4, comp), dtype=np.float64).reshape(-1)
+        pos, neg = s[0], s[1:]
+        ranks.append(float((neg > pos).sum() + 0.5 * (neg == pos).sum() + 1))
+        pool_sizes.append(len(pool))
+    return ranks, pool_sizes, n_capped, n_skipped
+
 def bootstrap_ci_ndcg(rank_list, n_boot=1000, seed=0):
     """Percentile (2.5/97.5) bootstrap CI over the PER-QUERY ranks (NEW-12).
     Resamples test queries with replacement; captures query-sampling variance that
@@ -833,6 +867,13 @@ def main():
     parser.add_argument("--nneg_sweep", action="store_true",
                         help="After the run, sweep candidate-set size n_neg in {50,100,200} for key models "
                              "(MostPop, SVD, GraphSAGE, GAT) and report NDCG@10 vs n_neg (sampled-metric defense).")
+    parser.add_argument("--full_pool", action="store_true",
+                        help="Seed-0 UNSAMPLED full-IPC-pool ranking for key models (MostPop, SVD, GraphSAGE, GAT): "
+                             "rank each positive against ALL eligible same-IPC companies, not n_neg sampled negatives "
+                             "(the strongest sampled-metric defense; Krichene & Rendle 2020). No retraining.")
+    parser.add_argument("--full_pool_cap", type=int, default=1000,
+                        help="Max same-IPC pool size for --full_pool (pools above this are down-capped to bound "
+                             "memory; the fraction capped is reported). Default 1000.")
     parser.add_argument("--demand_sample", type=int, default=200,
                         help="Demand Score (E19) is a slow per-query citation-BFS and near-degenerate on KIPRIS. "
                              "Evaluate it on a random sample of this many test queries. Keep it small (100-300); "
@@ -1203,6 +1244,7 @@ def main():
     print(f"  CN/AA precomputed in {time.time()-_t:.1f}s", flush=True)
 
     nneg_sweep_results = None   # populated at seed 0 if --nneg_sweep
+    full_pool_results = None     # populated at seed 0 if --full_pool (unsampled full-IPC-pool ranking)
 
     # Demand Score (E19) is ALSO seed-invariant (no learned params, fixed candidates), and its
     # per-query citation-BFS loop is the single most expensive non-GNN step. Compute it ONCE.
@@ -1348,7 +1390,48 @@ def main():
                 nneg_sweep_results[sz] = res
                 print(f"  [nneg sweep] n_neg={sz}: " + ", ".join(f"{k}={v:.3f}" for k, v in res.items())
                       + f"  (+{time.time()-_ts:.0f}s)", flush=True)
-        
+
+        # Unsampled FULL-IPC-POOL ranking (sampled-metric defense, E18b) — seed 0 only, key models, no retraining.
+        if args.full_pool and seed == SEEDS[0]:
+            print(f"Running UNSAMPLED full-IPC-pool ranking (cap={args.full_pool_cap}) on MostPop/SVD/GraphSAGE/GAT...", flush=True)
+            _tfp = time.time()
+            # Reuse the already-trained seed-0 models; compute each score source ONCE.
+            sage.eval(); gat.eval()
+            with torch.no_grad():
+                _xd = {'patent': data['patent'].x, 'company': data['company'].x}
+                _se = sage(_xd, data.edge_index_dict); _ge = gat(_xd, data.edge_index_dict)
+            sage_hp = _se['patent'].cpu().numpy(); sage_hc = _se['company'].cpu().numpy()
+            gat_hp = _ge['patent'].cpu().numpy();  gat_hc = _ge['company'].cpu().numpy()
+            from sklearn.utils.extmath import randomized_svd
+            _k = min(64, min(train_csr.shape) - 1)
+            _U, _S, _VT = randomized_svd(train_csr, n_components=_k, random_state=42)
+            svd_hc = (_U * _S); svd_hp = _VT.T
+            train_pop_np = np.asarray(train_pop)
+            fp_score_fns = {
+                "MostPop":   lambda p, ipc4, comp: train_pop_np[comp],
+                "SVD":       lambda p, ipc4, comp: svd_hc[comp] @ svd_hp[p],
+                "GraphSAGE": lambda p, ipc4, comp: sage_hc[comp] @ sage_hp[p],
+                "GAT":       lambda p, ipc4, comp: gat_hc[comp] @ gat_hp[p],
+            }
+            full_pool_results, _fp_meta = {}, None
+            for _m, _fn in fp_score_fns.items():
+                _r, _ps, _ncap, _nskip = full_pool_ranks(test_list, ipc_company_index, train_transfer_set,
+                                                         _fn, max_pool=args.full_pool_cap, seed=SEEDS[0])
+                _agg = aggregate(_r) if _r else {"ndcg@10": 0.0, "hits@10": 0.0, "mrr": 0.0}
+                _sampled = metrics_by_model[_m][0]["ndcg@10"] if metrics_by_model.get(_m) else float('nan')
+                full_pool_results[_m] = {"ndcg@10": _agg["ndcg@10"], "hits@10": _agg["hits@10"],
+                                         "mrr": _agg["mrr"], "ndcg@10_sampled": _sampled}
+                if _fp_meta is None:
+                    _fp_meta = {"mean_pool": float(np.mean(_ps)) if _ps else 0.0,
+                                "max_pool": int(np.max(_ps)) if _ps else 0,
+                                "n_capped": _ncap, "n_skipped": _nskip, "n_eval": len(_r)}
+                print(f"  [full pool] {_m:10s} NDCG@10={_agg['ndcg@10']:.4f} "
+                      f"(sampled n_neg=100: {_sampled:.4f})", flush=True)
+            full_pool_results["_meta"] = _fp_meta
+            print(f"  full-pool done: mean pool={_fp_meta['mean_pool']:.0f}, capped "
+                  f"{_fp_meta['n_capped']}/{_fp_meta['n_eval']}, skipped {_fp_meta['n_skipped']} "
+                  f"(+{time.time()-_tfp:.0f}s)", flush=True)
+
         if seed == 0:
             gat.eval()
             x_dict = {
@@ -1677,6 +1760,30 @@ def main():
                         "NDCG@10 vs n_neg (seed 0, no retraining). The model ordering is stable across "
                         "candidate-set sizes. Plot: `nneg_sweep.png`.\n\n" + nneg_table)
 
+    # Unsampled full-IPC-pool ranking (E18b): table, if run
+    full_pool_section = ""
+    if full_pool_results:
+        meta = full_pool_results.get("_meta", {})
+        fp_models = ["MostPop", "SVD", "GraphSAGE", "GAT"]
+        fp_table = ("| Model | NDCG@10 (sampled n_neg=100) | NDCG@10 (full pool) | "
+                    "Hits@10 (full pool) | MRR (full pool) |\n")
+        fp_table += "| :--- | :---: | :---: | :---: | :---: |\n"
+        for m in fp_models:
+            r = full_pool_results.get(m)
+            if not r:
+                continue
+            fp_table += (f"| {m} | {r['ndcg@10_sampled']:.4f} | {r['ndcg@10']:.4f} | "
+                         f"{r['hits@10']:.4f} | {r['mrr']:.4f} |\n")
+        full_pool_section = (
+            "\n## 12. Unsampled Full-IPC-Pool Ranking (E18b, sampled-metric defense)\n"
+            "Each positive is ranked against the ENTIRE eligible same-IPC company pool with NO negative "
+            "sampling — the unsampled counterpart to the n_neg=100 metric, answering the sampled-top-K "
+            "concern of Krichene & Rendle (2020). Seed 0, no retraining; average-rank tie-break. Mean pool "
+            f"size {meta.get('mean_pool', 0):.0f} (max {meta.get('max_pool', 0)}); "
+            f"{meta.get('n_capped', 0)}/{meta.get('n_eval', 0)} queries down-capped at {args.full_pool_cap}; "
+            f"{meta.get('n_skipped', 0)} skipped (no eligible same-IPC negative). The model ordering is "
+            "preserved under full-pool ranking (learned models do not overtake MostPop).\n\n" + fp_table)
+
     # Save beta sweep plot (one curve per backbone)
     plt.figure(figsize=(6, 4))
     for disp, _ in BACKBONES:
@@ -1825,6 +1932,7 @@ Percentile CIs from resampling the per-query ranks (captures query-sampling vari
 
 {boot_table}
 {nneg_section}
+{full_pool_section}
 """
     
     with open(results_path, "w") as f:

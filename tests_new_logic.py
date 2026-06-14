@@ -102,6 +102,38 @@ def test_cn_aa():
     print("  test_cn_aa OK")
 
 
+def test_full_pool_ranks():
+    # Unsampled full-IPC-pool ranking: positive ranked against the ENTIRE eligible same-IPC pool,
+    # excluding companies that already received this patent in train, with average-rank ties.
+    ipc_company_index = {"AAAA": {0, 1, 2, 3}}
+    train_pop = np.array([5.0, 9.0, 3.0, 1.0])
+    score_fn = lambda p, ipc4, comp: train_pop[comp]      # MostPop-style score
+
+    # (1) exclusion + ranking: patent 10 already transferred to company 2 in train -> 2 is not a candidate.
+    #     pool = {1,3}; cand=[0,1,3]; scores=[5,9,1]; pos=5 -> 1 neg greater (9), 0 ties -> rank 2.
+    ranks, sizes, n_capped, n_skipped = R.full_pool_ranks(
+        [(10, 0, "AAAA")], ipc_company_index, {(10, 2)}, score_fn, max_pool=1000, seed=0)
+    assert ranks == [2.0], ranks
+    assert sizes == [2] and n_capped == 0 and n_skipped == 0, (sizes, n_capped, n_skipped)
+
+    # (2) tie handling: positive tied with one negative -> +0.5. pop' = [5,5,1,1], pool {1,2,3}.
+    train_pop2 = np.array([5.0, 5.0, 1.0, 1.0])
+    score_fn2 = lambda p, ipc4, comp: train_pop2[comp]
+    r2, _, _, _ = R.full_pool_ranks([(10, 0, "AAAA")], ipc_company_index, set(), score_fn2, max_pool=1000, seed=0)
+    assert r2 == [1.5], r2          # neg scores {5,1,1}: 0 strictly greater, 1 tie -> 0 + 0.5 + 1 = 1.5
+
+    # (3) skip when no eligible negative (all same-IPC companies already received this patent).
+    _, _, _, nskip = R.full_pool_ranks(
+        [(20, 0, "AAAA")], ipc_company_index, {(20, 1), (20, 2), (20, 3)}, score_fn, max_pool=1000, seed=0)
+    assert nskip == 1, nskip
+
+    # (4) cap down-samples large pools (counted), bounding the candidate list.
+    _, sizes4, ncap4, _ = R.full_pool_ranks(
+        [(10, 0, "AAAA")], ipc_company_index, set(), score_fn, max_pool=1, seed=0)
+    assert ncap4 == 1 and sizes4 == [1], (ncap4, sizes4)
+    print("  test_full_pool_ranks OK")
+
+
 if __name__ == "__main__":
     test_cn_aa()
     test_tie_aware_ranks()
@@ -109,4 +141,5 @@ if __name__ == "__main__":
     test_bootstrap_ci()
     test_mostpop_ipc()
     test_classify_failures()
+    test_full_pool_ranks()
     print("ALL UNIT TESTS PASSED")

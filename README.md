@@ -30,6 +30,7 @@ Device auto-selects CUDA → MPS → CPU; override with `--device`. **Apple MPS 
 | `--split {temporal,random}` | temporal = realistic; random = leaky baseline for the temporal-vs-random contrast (RQ1) |
 | `--company_feat {random,content}` | GNN company node features: fixed random, or mean train-patent SBERT (leakage-free content) |
 | `--nneg_sweep` | candidate-set-size sensitivity {50,100,200} for key models (sampled-metric defense) |
+| `--full_pool` · `--full_pool_cap N` | **unsampled** full-IPC-pool ranking (seed 0, key models): rank the positive against *all* eligible same-IPC companies, not n_neg sampled negatives — the strongest sampled-metric defense (Krichene & Rendle, 2020). Pools above N (default 1000) are down-capped |
 | `--demand_sample N` | evaluate the slow rule-based Demand Score on N test queries (default 200) |
 | `--device {auto,cpu,cuda,mps}` · `--data_dir` · `--emb_path` · `--artifact_dir` | environment |
 
@@ -44,7 +45,7 @@ For a quick functional test without real data, `make_mock_data.py` writes tiny K
 The KIPRIS patent data is obtained from the **Korea Intellectual Property Rights Information Service (KIPRIS) API** (http://www.kipris.or.kr / plus.kipris.or.kr). Access requires a (free) KIPRIS Plus API key; the fields used are listed above. We release the preprocessing and evaluation code here; the raw KIPRIS exports are redistributed subject to KIPRIS terms. A `patent_embeddings.pt` regeneration script (`train_gnn_full_scale.py`) is included so embeddings can be rebuilt from the patent text.
 
 ## Outputs (`--artifact_dir`)
-`run_ipm_results.md` (Table 4 main results, Table 5 diagnostics, statistics, §5–11 diagnostics) plus figures (`gat_attention_violin.png`, `popularity_stratified.png`, `ips_rerank_sweep.png`, `popularity_debiased_sweep.png`, `horizon_decay.png`, `nneg_sweep.png`). Publication figures are generated separately by `make_figures.py` → `paper_figures/`.
+`run_ipm_results.md` (Table 4 main results, Table 5 diagnostics, statistics, §5–11 diagnostics, §12 unsampled full-pool ranking when `--full_pool`) plus figures (`gat_attention_violin.png`, `popularity_stratified.png`, `ips_rerank_sweep.png`, `popularity_debiased_sweep.png`, `horizon_decay.png`, `nneg_sweep.png`). Publication figures are generated separately by `make_figures.py` → `paper_figures/`.
 
 ## Repository guide
 - **Code**: `run_ipm_experiment.py` (the full suite), `make_mock_data.py` (test fixtures), `tests_new_logic.py` (unit tests), `make_figures.py` (paper figures). Legacy standalone evaluators (`evaluate_*`, `train_gnn_full_scale.py`, `tune_hyperparams.py`, `methodology_demo.py`) predate the current suite.
