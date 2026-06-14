@@ -467,3 +467,75 @@ The contributions of this work are therefore diagnostic rather than a claim of m
 - [ ] 인용 스타일 통일: 본문 §3의 `[1]` 식 numbered ↔ 신규 섹션 author-year → IPM 표준(보통 numbered)로 일원화
 - [ ] 섹션 번호 정렬: 현 원고 3=Methodology/4=Results 체계에 맞춰 본 신규 섹션 번호(1·2·7·8) 재매핑
 - [ ] **Table 4를 average-rank 기준 최종 10-seed로 재생성** 후 게재 — 신규 섹션 수치와 자동 정합 (CLAUDE.md: 숫자 바뀌면 results.md 먼저 재생성)
+
+---
+---
+
+# IPM 강화용 추가 섹션 (문제정식화 · 구성타당도 · 위협 · 평가 체크리스트 · 신규 ablation)
+
+> 결과와 무관하게 지금 넣을 수 있는, IPM 심사를 단단하게 하는 서술. `기존: 없음 → 수정 제안`.
+
+## P1. Problem Formulation & Notation (신규 §3 도입부)
+
+**기존:** (형식적 문제 정의·표기 부재 — 원고가 §4부터 시작)
+
+**수정 제안:**
+> We model patent technology-transfer demand prediction as link prediction on a heterogeneous graph $G=(V,E)$ with node sets $V = P \cup C$ ($P$ patents, $|P|=370{,}666$; $C$ companies, $|C|=122{,}519$) and two undirected-typed edge sets: citations $E_{\text{cite}} \subseteq P\times P$ ($|E_{\text{cite}}|\approx 910{,}000$) and realized transfers $E_{\text{tr}} \subseteq P\times C$. Each patent carries a frozen 384-dimensional sentence embedding $x_p$; company features $x_c$ are fixed-random (or, in one ablation, content-based, §[ablation]). An encoder $f_\theta$ maps nodes to representations $h_p,h_c\in\mathbb{R}^{16}$ using message passing over $E_{\text{cite}}$ and the *training-split* transfers only, and a parameter-free decoder scores a candidate pair by the dot product $s(p,c)=h_p^\top h_c$. For a held-out test transfer $(p,c^{+})$ we form a candidate set $\mathrm{Cand}(p)=\{c^{+}\}\cup C^{-}(p)$, where $C^{-}(p)$ are $n_{\text{neg}}=100$ *same-IPC hard negatives* (companies that transferred a patent of $p$'s four-digit IPC class in training but not $p$), and report the average-rank of $c^{+}$ in $\mathrm{Cand}(p)$.
+
+**Notation (표):**
+| Symbol | Meaning |
+| :-- | :-- |
+| $G=(V,E)$, $V=P\cup C$ | heterogeneous graph; patent / company nodes |
+| $E_{\text{cite}}, E_{\text{tr}}$ | citation edges; (realized) transfer edges |
+| $x_p\in\mathbb{R}^{384}$, $x_c$ | frozen SBERT patent feature; company feature (random / content) |
+| $h_p,h_c\in\mathbb{R}^{16}$ | encoder node representations |
+| $s(p,c)=h_p^\top h_c$ | dot-product link score |
+| $C^{-}(p)$, $n_{\text{neg}}$ | same-IPC hard negatives; candidate-set size (100) |
+| $\mathrm{rank}(c^{+}\mid p)$ | average-rank of the positive among candidates |
+
+**근거:** 코드의 실제 구성(hetero graph, 384-d SBERT, out_dim 16, dot decoder, 100 same-IPC hard-neg, average-rank)과 일치. **권장: 그래프 스키마/파이프라인 그림 1개**(`paper_figures/fig0_pipeline.png`)를 §3에 배치.
+
+## P2. Construct Validity — "realized transfer ≠ latent demand" (위협 명시)
+
+**기존:** Intro에 한 문장만.
+
+**수정 제안 (Threats/Discussion에 한 단락):**
+> A construct-validity caveat underlies the whole study: our supervision is *realized* transfers, not latent demand. A company that would value a patent but never transacted it is, by construction, a negative. Consequently a model that perfectly predicted realized transfers would still only recover the historical matching process — including its popularity and exposure biases — rather than an unobserved demand. We therefore frame the target as *transfer-demand as revealed by historical assignment*, and we read the popularity-bias diagnosis (a model reproducing the assignment frequency distribution) partly as a property of the supervision signal itself, not solely of the models.
+
+**근거:** demand=realized transfer라는 조작적 정의의 한계를 리뷰어가 반드시 물음 — 선제 명시.
+
+## P3. Threats to Validity (정식 절)
+
+**수정 제안 (신규 절):**
+> **Internal validity.** Transfer supervision is split strictly by registration date and message-passed only on the train split, removing target leakage; popularity/recency/time features are computed from train only. A residual threat is that citation edges are not time-filtered (§Limitations). Tie-breaking is average-rank, which we show is necessary to avoid a strict-`>` inflation artifact.
+> **External validity.** Results are on a single jurisdiction (KIPRIS); we cannot claim the collapse generalizes to other markets without replication (we discuss USPTO and public-benchmark replication as future work).
+> **Construct validity.** See P2 — the target is realized transfer, an operationalization of demand.
+> **Statistical-conclusion validity.** Ten seeds with Wilcoxon signed-rank + Holm–Bonferroni and bootstrap CIs over queries; we report effect sizes (metric differences) alongside adjusted p-values, and explicitly compute the chance floor for the sampled-ranking metrics.
+
+**근거:** IPM은 validity 4분류를 선호. 현 코드/프로토콜이 이미 충족하는 부분(시간분할·통계)과 미충족(외적타당성·citation 누수)을 솔직히 매핑.
+
+## P4. An Evaluation Checklist (패키징된 방법론 기여)
+
+**수정 제안 (박스/표로 §평가 또는 §결론에):**
+> We distill the protocol into a reusable checklist for cold-start-heavy link-prediction / recommendation evaluation:
+> 1. **Temporal split** by event time (not random) to avoid future-to-past leakage.
+> 2. **Hard negatives** from the same semantic class (here, same-IPC), not uniform random.
+> 3. **Average-rank tie-breaking** so a no-information (all-tied) model scores at chance, not perfect.
+> 4. **A strong popularity skyline** (global and class-conditional MostPop) as the bar to beat — not merely a weaker learned baseline.
+> 5. **Tie-aware AUC** reported alongside top-K metrics (a high NDCG with chance AUC signals a tie/degeneracy artifact).
+> 6. **Cold-start accounting**: report the unseen fraction (item and user side) and decompose metrics by it.
+> 7. **Multi-seed** runs with paired non-parametric tests + multiple-comparison correction, and **candidate-set-size sensitivity**.
+
+**근거:** "patent 음성결과"를 *재사용 가능한 평가 처방*으로 격상 → 방법론 기여를 눈에 보이게(IPM 일반화 요구 충족).
+
+## P5. (신규 ablation) Content vs random company features
+
+**수정 제안 (Results/Ablation 행 추가):**
+> A natural objection is that the GNNs underperform only because company nodes carry no content. We therefore ablate the company representation: replacing the fixed-random feature with the **mean frozen-SBERT of each company's training-received patents** (leakage-free; cold companies retain a random fallback). [결과로 확정] We report whether this content representation lets any GNN exceed the popularity baseline; [if it does not] this rules out "uninformative company features" as the sole explanation and strengthens the popularity-bias + cold-start diagnosis.
+
+**근거:** `--company_feat content` 구현 완료(mean train-patent SBERT). 이 ablation을 돌리면 "기업 피처가 랜덤이라 진 것" 반박을 차단. 실행: `--company_feat content` 추가해 한 번 더 → GNN 행만 비교(나머지 동일).
+
+## P6. 정량 보강 메모
+- **Chance floor 명시**: random ranking 기준 NDCG@10 ≈ 0.045, AUC = 0.5를 결과표 각주로. (무정보=동점→average-rank rank 51 → NDCG 0이 chance보다도 낮은 이유까지 한 문장.)
+- **효과크기**: p값과 함께 평균 NDCG@10 차이(Δ) 보고. 이미 표에 mean±std 있으니 Δ만 명시.
+- **"below popularity" 격차의 bootstrap CI**: GAT−MostPop 등 핵심 격차에 쿼리 bootstrap CI(코드의 ranks 저장 활용) — §10 부트스트랩을 모델쌍 차이로 확장 가능.

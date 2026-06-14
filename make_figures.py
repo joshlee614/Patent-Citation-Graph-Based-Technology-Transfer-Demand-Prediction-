@@ -175,7 +175,61 @@ def fig7_sweeps():
     fig.tight_layout(rect=(0, 0, 1, 0.95)); fig.savefig(f"{OUT}/fig7_mitigation_sweeps.png"); plt.close(fig)
 
 
+def fig0_pipeline():
+    from matplotlib.patches import FancyBboxPatch, Circle, FancyArrowPatch
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(12, 4.2), gridspec_kw={"width_ratios": [1, 1.5]})
+
+    # (a) heterogeneous graph schema
+    axA.set_xlim(0, 10); axA.set_ylim(0, 10); axA.axis("off")
+    axA.set_title("(a) Heterogeneous graph", fontsize=11)
+    pat = [(2, 7.5), (2, 4.5)]           # patent nodes
+    comp = [(7.5, 8), (7.5, 5.5), (7.5, 3)]  # company nodes
+    for (x, y) in pat:
+        axA.add_patch(Circle((x, y), 0.7, color="#4477AA", zorder=3))
+        axA.text(x, y, "P", color="white", ha="center", va="center", fontsize=11, zorder=4)
+    for (x, y) in comp:
+        axA.add_patch(FancyBboxPatch((x - 0.6, y - 0.5), 1.2, 1.0, boxstyle="round,pad=0.02",
+                                     color="#EE6677", zorder=3))
+        axA.text(x, y, "C", color="white", ha="center", va="center", fontsize=11, zorder=4)
+    # citation edge (patent-patent)
+    axA.add_patch(FancyArrowPatch(pat[0], pat[1], arrowstyle="-|>", color="#888888",
+                                  mutation_scale=14, lw=1.6, shrinkA=18, shrinkB=18))
+    axA.text(1.1, 6.0, "cites", color="#555555", fontsize=8, rotation=90)
+    # transfer edges (patent-company)
+    for (px, py) in pat:
+        for (cx, cy) in comp:
+            axA.add_patch(FancyArrowPatch((px, py), (cx, cy), arrowstyle="-|>", color="#CC8844",
+                                          mutation_scale=10, lw=1.0, alpha=0.55, shrinkA=18, shrinkB=16))
+    axA.text(4.4, 8.7, "transfer", color="#AA6622", fontsize=8)
+    axA.text(2, 9.2, "Patent (frozen SBERT)", ha="center", fontsize=8.5, color="#4477AA")
+    axA.text(7.5, 9.6, "Company", ha="center", fontsize=8.5, color="#EE6677")
+
+    # (b) evaluation pipeline
+    axB.set_xlim(0, 16); axB.set_ylim(0, 6); axB.axis("off")
+    axB.set_title("(b) Leakage-free evaluation pipeline", fontsize=11)
+    steps = [
+        ("Patent text\n→ frozen SBERT", "#4477AA"),
+        ("Heterogeneous\nGNN encoder\n(train-split edges)", "#66AA66"),
+        ("dot-product\nscore s(p,c)", "#888888"),
+        ("rank vs 100\nsame-IPC\nhard negatives", "#CCBB44"),
+        ("average-rank\n→ NDCG / AUC", "#EE6677"),
+    ]
+    w, gap = 2.7, 0.45
+    for i, (txt, col) in enumerate(steps):
+        x = i * (w + gap)
+        axB.add_patch(FancyBboxPatch((x, 2), w, 2, boxstyle="round,pad=0.05", fc="white", ec=col, lw=2))
+        axB.text(x + w / 2, 3, txt, ha="center", va="center", fontsize=8.2)
+        if i < len(steps) - 1:
+            axB.add_patch(FancyArrowPatch((x + w, 3), (x + w + gap, 3), arrowstyle="-|>",
+                                          mutation_scale=14, color="#333333", lw=1.4))
+    axB.text(8, 0.8, "Transfers split temporally 70/15/15 by registration date; "
+                     "test = most recent 15% (≈91.7% of test patents unseen)", ha="center", fontsize=8, color="#555555")
+    fig.tight_layout()
+    fig.savefig(f"{OUT}/fig0_pipeline.png"); plt.close(fig)
+
+
 if __name__ == "__main__":
+    fig0_pipeline()
     fig1_main(); fig2_tiebreak(); fig3_popbias(); fig4_stratified()
     fig5_coldstart(); fig6_error(); fig7_sweeps()
     print("Figures written to", OUT + "/:")
