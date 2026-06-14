@@ -18,8 +18,13 @@
 
 \begin{frontmatter}
 
-\title{When Learned Models Lose to Popularity: A Diagnosis of Patent
-Technology-Transfer Demand Prediction under Realistic Evaluation}
+\title{Popularity Bias and Cold-Start in Patent Technology-Transfer
+Demand Prediction: A Diagnostic Evaluation of Graph- and Content-Based
+Link Prediction on KIPRIS}
+%% Alternative title (also IP&M-appropriate, slightly shorter):
+%% \title{When Learned Models Do Not Beat a Popularity Baseline:
+%% A Diagnostic Evaluation of Patent Technology-Transfer Demand Prediction
+%% under a Temporal, Hard-Negative Protocol}
 
 %% --- Author block intentionally omitted for double-anonymized review. ---
 %% (Authors, affiliations, corresponding-author details, acknowledgements,
@@ -39,23 +44,23 @@ filtering (LightGCN, NGCF), matrix factorization (SVD), structural heuristics
 most-popular baseline (MostPop NDCG@10\,=\,0.197; the strongest learned model, a
 text MLP, reaches only 0.150), with AUC near chance (0.42--0.60). Two causes
 account for this: popularity bias (98.8\% of GraphSAGE and 57.8\% of GAT errors
-are losses to a more-popular hard negative; score--popularity correlation up to
-$\rho=1.0$) and extreme patent cold-start (91.7\% of test patents unseen; SVD
+are losses to a more-popular hard negative; score--popularity $\rho$ up to 1.0)
+and patent cold-start (91.7\% of test patents unseen; SVD
 NDCG@10\,=\,0.000 on new patents). We document an evaluation artifact whereby a
 strict greater-than tie-break inflates degenerate cold-start models toward
-perfect scores, which average-rank tie-breaking removes. A controlled random-split
-contrast shows the protocol is decisive: a random split lowers cold-start to 2.4\%
-and makes SVD the single best method (NDCG@10\,=\,0.442, AUC\,=\,0.830), the exact
-reverse of the temporal verdict. Our contributions are the evaluation protocol, a
-suite of bias and cold-start diagnostics, and a symmetric grid of mitigation
-baselines that yield only partial, unstable gains.
+high scores, which average-rank tie-breaking removes. A controlled random-split
+contrast shows the protocol determines the outcome: a random split lowers cold-start to 2.4\%
+and makes SVD the single best method (NDCG@10\,=\,0.442, AUC\,=\,0.830), the reversal
+of the temporal verdict. We contribute the evaluation protocol, a suite of bias and cold-start
+diagnostics, and a symmetric grid of mitigation baselines that yield only
+partial, unstable gains.
 \end{abstract}
 
 \begin{highlights}
 \item Under a temporal, same-IPC hard-negative protocol, no learned model beats a popularity baseline on KIPRIS patent-transfer prediction.
 \item The failure is traced to popularity bias (score--popularity $\rho$ up to 1.0) and a 91.7\% patent cold-start regime.
 \item A strict tie-break inflates degenerate cold-start models to near-perfect scores; average-rank tie-breaking is required.
-\item A random split reverses the verdict (SVD becomes best at 0.442), showing the evaluation protocol is decisive.
+\item A random split reverses the verdict (SVD becomes best at 0.442), showing that the protocol, not the model, determines the outcome.
 \item Standard popularity-bias mitigations (IPS, logQ, debiased sampling) give only partial, unstable gains.
 \end{highlights}
 
@@ -98,8 +103,10 @@ features. The expectation that such methods outperform simple heuristics is the
 default working hypothesis in much of the literature and motivates a growing line of
 patent-recommendation systems \cite{krestel2021,choi2019,chendeng2023,liu2024}. Most
 directly, a recent GAT--NGCF firm--patent recommender on Korean technology-transfer
-data reports Recall@5\,=\,0.998 and NDCG@5\,=\,0.997 \cite{kim2025} --- results that,
-as we show, do not survive a leakage-free, same-IPC hard-negative re-evaluation.
+data reports Recall@5\,=\,0.998 and NDCG@5\,=\,0.997 \cite{kim2025}. Such
+near-perfect figures rest on random-split, sampled-negative evaluation; the
+gap we document is that they do not survive a leakage-free, temporal, same-IPC
+hard-negative re-evaluation, which is the research gap this paper addresses.
 
 That expectation is sensitive to how performance is measured. \emph{Random edge
 splits} break temporal order and leak future transfers \cite{meng2020};
@@ -118,7 +125,8 @@ diagnostic finding: under a temporal 70/15/15 split with same-IPC hard negatives
 test falls below simple popularity baselines.} The dataset comprises 370,666
 patents, 122,519 companies, and $\approx$910,000 citation edges, yielding
 $\approx$220,284 temporally held-out test queries. A most-popular ranker attains
-NDCG@10\,=\,0.197; an IPC-conditional skyline reaches 0.199; and NGCF --- which our
+NDCG@10\,=\,0.197; an IPC-conditional skyline reaches 0.199 (the top NDCG@10, though
+at a below-chance global AUC of 0.416; see \S\ref{sec:main}); and NGCF --- which our
 diagnostics show to be a popularity ranker ($\rho=0.96$) --- reaches 0.196. The
 strongest learned model with above-chance discrimination is a text MLP at 0.150;
 among graph models, GraphSAGE+logQ reaches 0.125 and GAT+logQ 0.107; all lie well
@@ -129,8 +137,8 @@ well-tuned baselines \cite{dacrema2019} and that easy negatives inflate GNN
 link-prediction \cite{li2023}.
 
 We trace the result to two causes and quantify each. First, \emph{popularity bias}:
-98.8\% of GraphSAGE and 57.8\% of GAT failures are losses to a more-popular same-IPC
-hard negative; the hard-negative inversion rate is 56\% for MostPop and NGCF and 28\%
+98.8\% of GraphSAGE and 57.8\% of GAT errors are losses to a more-popular same-IPC
+hard negative; the hard-negative inversion rate (the share of queries in which a more-popular candidate outranks the positive) is 56\% for MostPop and NGCF and 28\%
 for GAT; and score--popularity Spearman correlation is 1.0 for MostPop and 0.96 for
 NGCF. A GAT attention analysis (Mann--Whitney U over hub vs.\ non-hub edges,
 $p=1.0$) shows no down-weighting of popular hubs. Second, \emph{extreme patent
@@ -141,27 +149,31 @@ gains are partial and unstable (\S\ref{sec:mitigation}).
 
 A further contribution is methodological. Under a strict greater-than tie-break,
 cold-start models whose scores are degenerate place the positive first among tied
-candidates and appear near-perfect (\S\ref{sec:tiebreak}); an average-rank
+candidates and attain inflated scores (\S\ref{sec:tiebreak}); an average-rank
 tie-break removes this artifact. These observations motivate three research
-questions answered in the paper:
+questions addressed in the paper:
 \begin{itemize}
 \item \textbf{RQ1.} Does a realistic protocol (temporal split + same-IPC hard
 negatives) change measured performance relative to a random split?
-(\S\ref{sec:rq1}: yes, decisively.)
+(\S\ref{sec:rq1}: yes.)
 \item \textbf{RQ2.} What accounts for the performance --- popularity bias, cold-start,
 or both --- and how is each quantified? (\S\ref{sec:popbias}--\S\ref{sec:error}.)
 \item \textbf{RQ3.} Can popularity-bias mitigations recover learned models above the
 popularity baselines? (\S\ref{sec:mitigation}: not reliably.)
 \end{itemize}
 
-\noindent Our contributions are: (i) a realistic evaluation protocol for the task on
-KIPRIS; (ii) a diagnosis that GNNs, CF, MF, structural heuristics, and a text MLP all
-fall below popularity baselines with AUC near chance; (iii) a suite of
-bias-diagnostic tools that localize the failure; (iv) a mitigation grid showing only
-partial gains; and (v) the strict-tie-break artifact and its average-rank correction,
-corroborated by an unsampled full-pool metric and a temporal-vs-random contrast. The
-aim is not a winning model but an evaluation protocol and diagnosis to discipline
-future work. Figure~\ref{fig:overview} gives an overview.
+\noindent The contributions are: (i) a leakage-free evaluation protocol for the
+task on KIPRIS, combining a temporal split, same-IPC hard negatives, explicit
+cold-start accounting, and an average-rank tie-break; (ii) a diagnosis that
+GNNs, CF, MF, structural heuristics, and a text MLP all fall below popularity
+baselines, with AUC near chance, together with the quantification of
+popularity bias and cold-start that explains why; (iii) a reusable suite of
+bias-diagnostic tools that localize the failure; (iv) a mitigation grid showing
+only partial, unstable gains; and (v) identification of a strict-tie-break
+artifact and its average-rank correction, corroborated by an unsampled
+full-pool metric and a temporal-versus-random contrast. The aim is not a
+winning model but an evaluation protocol and diagnosis to discipline future
+work. Figure~\ref{fig:overview} gives an overview.
 
 \begin{figure*}[t]
 \centering
@@ -185,7 +197,7 @@ Our study sits at the intersection of four lines of work: patent analytics and
 technology-transfer prediction; GNNs for link prediction and recommendation;
 popularity bias and debiasing; and evaluation methodology for ranking under temporal
 and sampled-metric constraints. We also use structural link-prediction heuristics as
-non-learned baselines. The recurring theme is that our contribution is diagnostic:
+non-learned baselines. The recurring theme is that this paper's contribution is diagnostic:
 we do not propose a model that outperforms prior art, but an evaluation protocol and
 diagnostic tools that explain \emph{why}, on this task and dataset, learned models do
 not separate from popularity baselines.
@@ -279,14 +291,16 @@ with the only learned company-side parameters being a shared linear projection; 
 LightGCN/NGCF use a learnable per-company identity embedding ($d=64$). An encoder
 $f_\theta$ maps nodes to $h_p,h_c\in\mathbb{R}^{16}$ by message passing over
 $E_{\mathrm{cite}}$ and the \emph{training-split} transfers only, and a parameter-free
-decoder scores a pair by $s(p,c)=h_p^{\top}h_c$. For a held-out test transfer
+decoder scores a pair by the dot product $s(p,c)=h_p^{\top}h_c$; this is the same
+score optimized by the training loss (\S\ref{sec:data}, Models) and re-ranked by the
+IPS / logQ mitigations (\S\ref{sec:mitigation}). For a held-out test transfer
 $(p,c^{+})$ we form $\mathrm{Cand}(p)=\{c^{+}\}\cup C^{-}(p)$, where $C^{-}(p)$ are
 $n_{\mathrm{neg}}=100$ same-IPC hard negatives --- companies that received a same-IPC
 patent in training but not $p$ --- and report the average rank of $c^{+}$.
 Table~\ref{tab:notation} summarizes the notation. A construct-validity caveat
 underlies the study: the supervision is \emph{realized} transfers, so a model that
 perfectly predicted them would recover the historical (and biased) matching process,
-not a latent demand.
+not latent demand.
 
 \begin{table}[t]
 \centering
@@ -308,16 +322,19 @@ $\mathrm{rank}(c^{+}\mid p)$ & average rank of the positive among candidates \\
 \end{table}
 
 \subsection{Models Evaluated}
-We evaluate nine base models --- three non-learning skylines (\textbf{MostPop},
-IPC-conditional \textbf{MostPop-IPC}, \textbf{Recency}), two structural heuristics
-(\textbf{Common Neighbors}, \textbf{Adamic--Adar}), \textbf{SVD} ($k{=}64$), a
-text-only \textbf{MLP}, and two CF models (\textbf{LightGCN}, \textbf{NGCF}) ---
-together with two heterogeneous GNNs (\textbf{GraphSAGE}, \textbf{GAT}), and a
+We evaluate nine base models --- three non-learning skylines (MostPop,
+IPC-conditional MostPop-IPC, and Recency --- which ranks candidate companies by the
+recency of their most recent training transfer, scoring more recent acquirers higher
+--- ), two structural heuristics
+(Common Neighbors, Adamic--Adar), SVD ($k{=}64$), a
+text-only MLP, and two CF models (LightGCN, NGCF) ---
+together with two heterogeneous GNNs (GraphSAGE, GAT), and a
 \emph{symmetric mitigation grid} applying each of \{Debias, logQ, DropEdge, time
 encoding, IPS\} and two stacked combinations (Debias+IPS, Time+IPS) to \emph{both}
 GNN backbones. GAT uses a single-head, scatter-based attention layer that can return
-attention weights for diagnostics. Training minimizes a binary objective over
-observed transfers and sampled negatives, with early stopping on validation NDCG@10
+attention weights for diagnostics. Training minimizes a binary cross-entropy loss
+on the dot-product scores $s(p,c)=h_p^{\top}h_c$ of observed transfers (label 1)
+and sampled negatives (label 0), i.e.\ $\mathcal{L}=-\sum_{(p,c^{+})}\log\sigma(s(p,c^{+}))-\sum_{(p,c^{-})}\log(1-\sigma(s(p,c^{-})))$, with early stopping on validation NDCG@10
 (patience 5).
 
 %% ===========================================================================
@@ -332,14 +349,14 @@ split alone, removing the target leakage a random split would introduce.
 \paragraph{Same-IPC hard negatives.} For each test query $(p,c^{+},\mathrm{ipc4})$,
 the candidate set is the positive plus $n_{\mathrm{neg}}=100$ companies drawn
 (seed-fixed) from those that received a same-IPC patent in training but not $p$
-(average padding rate 1.07\% when fewer than 100 exist).
+(average padding rate 1.07\% when fewer than 100 same-IPC companies exist; padding fills the candidate set with uniformly drawn non-positive companies so every query has exactly $n_{\mathrm{neg}}$ negatives).
 
 \paragraph{Metrics and tie-break.} We report Hits@$K$ and NDCG@$K$ for
 $K\in\{1,3,5,10\}$, MRR, and a tie-aware rank-AUC (ties counted as 0.5). Ties are
-resolved by \textbf{average rank}: a candidate that ties the positive contributes 0.5
-to its rank. This is essential --- under a strict greater-than rule a no-information
-model whose candidates all tie places the positive first by construction and scores
-near-perfect (\S\ref{sec:tiebreak}).
+resolved by \emph{average rank}: a candidate that ties the positive contributes 0.5
+to its rank. This is necessary, because under a strict greater-than rule a no-information
+model whose candidates all tie places the positive first and scores
+spuriously high (\S\ref{sec:tiebreak}).
 
 \paragraph{Statistics.} Every configuration is run over ten seeds. We test a
 pre-registered family of pairwise comparisons with the Wilcoxon signed-rank test
@@ -375,7 +392,11 @@ alternatives. Figure~\ref{fig:main} plots all models.
 \begin{table}[t]
 \centering
 \caption{Main results, temporal split, 10 seeds (mean). The three top NDCG@10 rows
-are non-learned or popularity-equivalent. Full 25-row table (with standard
+are non-learned or popularity-equivalent. MostPop-IPC tops NDCG@10 (0.199) yet has a
+below-chance AUC (0.416): ranking by same-IPC-conditional popularity places the
+positive well within the top-$K$ of its own IPC class, but inverts the global
+pairwise ordering of positives against out-of-class candidates, so the two metrics
+diverge. Full 25-row table (with standard
 deviations and all mitigation variants) in the supplementary results file.}
 \label{tab:main}
 \begin{tabular}{lccccc}
@@ -415,17 +436,18 @@ chance.}
 \label{sec:popbias}
 Three diagnostics localize the failure to popularity bias (Table~\ref{tab:popbias},
 Figure~\ref{fig:popbias}). (i) The Spearman $\rho$ between a model's candidate scores
-and the candidates' training popularity is 1.0 for MostPop and \textbf{0.96 for NGCF}
+and the candidates' training popularity is 1.0 for MostPop and 0.96 for NGCF
 --- NGCF ranks almost exactly like a popularity counter, which is why its NDCG@10
 (0.196) matches MostPop's. GAT has $\rho=-0.05$. (ii) A more-popular negative is
-ranked above the true positive in \textbf{56.4\%} of MostPop and \textbf{56.3\%} of
-NGCF queries, versus \textbf{28.4\%} for GAT. (iii) A Mann--Whitney U test comparing
+ranked above the true positive in 56.4\% of MostPop and 56.3\% of
+NGCF queries, versus 28.4\% for GAT. (iii) A Mann--Whitney U test comparing
 GAT's attention on edges to popular (top-5\%) hub companies versus non-hub companies
 yields $p=1.0$: GAT does \emph{not} down-weight popular hubs. Stratifying GAT's
 accuracy by company popularity shows it does worst on the popular head
-(NDCG@10\,=\,0.016) and best on the unpopular tail (0.370) --- the opposite of a
-popularity-exploiting model, yet its absolute accuracy stays far below MostPop because
-the head holds most positives (Figure~\ref{fig:stratified}).
+(NDCG@10\,=\,0.016, torso 0.082) and best on the unpopular tail (0.370) --- the
+opposite of a popularity-exploiting model, yet its absolute accuracy stays far below
+MostPop because the head holds most positives, so the head-stratum score dominates
+the aggregate (Figure~\ref{fig:stratified}).
 
 \begin{table}[t]
 \centering
@@ -466,9 +488,9 @@ tail and worst on the popular head, but absolute values stay far below MostPop.}
 
 \subsection{Patent Cold-Start (RQ2)}
 \label{sec:coldstart}
-Under the temporal split, \textbf{91.7\% of test patents are unseen in training}.
-Decomposing accuracy by patent novelty is decisive for SVD: on the new-patent subset
-its NDCG@10 is \textbf{0.000} (its latent factor for an unseen patent is zero), whereas
+Under the temporal split, 91.7\% of test patents are unseen in training.
+Decomposing accuracy by patent novelty matters most for SVD: on the new-patent subset
+its NDCG@10 is 0.000 (its latent factor for an unseen patent is zero), whereas
 on the seen-patent subset it reaches 0.439. Because new patents dominate, SVD's overall
 score collapses to 0.037. The popularity baselines degrade gracefully (MostPop
 new-patent 0.212 vs.\ seen 0.324) because a popular company remains a good guess
@@ -487,12 +509,12 @@ gracefully.}
 \subsection{Error-Source Decomposition (RQ2)}
 \label{sec:error}
 Attributing each failure to a cause (priority: popularity $>$ rare/new $>$ residual)
-shows the backbones fail differently (Figure~\ref{fig:error}). For \textbf{GraphSAGE,
-98.8\%} of failures are losses to a more-popular hard negative (0.1\% rare/new, 1.1\%
-residual): it fails almost entirely through popularity. For \textbf{GAT, 57.8\% /
-8.3\% / 33.9\%} --- popularity still dominates, but a third of GAT's errors are a
-semantic residual, consistent with its near-zero popularity correlation. Both fail;
-they fail by different mechanisms.
+shows the backbones fail differently (Figure~\ref{fig:error}). For GraphSAGE,
+98.8\% of failures are losses to a more-popular hard negative (0.1\% rare/new, 1.1\%
+residual): it fails almost entirely through popularity. For GAT, the shares are 57.8\% /
+8.3\% / 33.9\% --- popularity still dominates, but a third of GAT's errors are a
+semantic residual, consistent with its near-zero popularity correlation. The two
+backbones fail through different mechanisms.
 
 \begin{figure}[t]
 \centering
@@ -513,12 +535,12 @@ assigns every candidate the same score, such a model is ranked first on essentia
 every cold query and appears near-perfect. In an earlier strict-rule evaluation this
 inflated SVD (whose latent factor for an unseen patent is zero, leaving all candidates
 tied) to NDCG@10 $\approx$ 0.95, and a fully-tied GraphSAGE+logQ to 1.00 by
-construction. Replacing the strict rule with an \textbf{average-rank} tie-break (a tie
+construction. Replacing the strict rule with an \emph{average-rank} tie-break (a tie
 contributes 0.5 to the positive's rank, so a fully-tied candidate set yields rank
 $(n_{\mathrm{neg}}{+}1)/2$, i.e.\ chance) removes the artifact and returns these models
 to their true ten-seed levels: SVD\,=\,0.037 and GraphSAGE+logQ\,=\,0.125 (and the
 partially-degenerate GAT from $\approx$0.45 to 0.074). Figure~\ref{fig:tiebreak}
-contrasts the rules. We regard this as a generic pitfall for sampled-ranking
+contrasts the rules. This is a generic pitfall for sampled-ranking
 evaluation of cold-start link prediction.
 
 \begin{figure}[t]
@@ -546,17 +568,17 @@ candidates and with no sampling, no learned model beats MostPop \cite{krichene20
 \label{sec:rq1}
 To quantify how much the protocol matters, we re-ran every model under a conventional
 random 70/15/15 split (Table~\ref{tab:rq1}, Figure~\ref{fig:split}). A random split
-lowers the patent cold-start rate from \textbf{91.7\% to 2.4\%}, because patents are
+lowers the patent cold-start rate from 91.7\% to 2.4\%, because patents are
 scattered across train and test rather than held out by time. Under it,
-\textbf{matrix factorization becomes the single strongest method}: SVD rises from
-NDCG@10\,=\,0.037 (AUC 0.52) to \textbf{0.442 (AUC 0.830)}, comfortably exceeding
-MostPop (0.219) --- the exact reverse of the temporal verdict. AUC inflates across the
+matrix factorization becomes the single strongest method: SVD rises from
+NDCG@10\,=\,0.037 (AUC 0.52) to 0.442 (AUC 0.830), comfortably exceeding
+MostPop (0.219), reversing the temporal verdict. AUC inflates across the
 board (MostPop $0.583\!\to\!0.667$; GAT $0.519\!\to\!0.650$). The mechanism is
-transparent: with only 2.4\% new patents, SVD's latent factors (useless on
+straightforward: with only 2.4\% new patents, SVD's latent factors (useless on
 truly-unseen patents --- its random-split new-patent NDCG@10 is still 0.0002) almost
 always apply. A random-split evaluation would therefore have reported a clear
-learned-model win; the realistic protocol, by exposing the cold-start regime the
-random split conceals, overturns it. This is the empirical core of RQ1 and the reason
+learned-model advantage; the realistic protocol, by exposing the cold-start regime the
+random split conceals, reverses this outcome. This is the empirical core of RQ1 and the reason
 near-perfect numbers in prior random-split patent recommenders \cite{kim2025} do not
 contradict our diagnosis.
 
@@ -594,10 +616,16 @@ NDCG@10, and (b) AUC inflates across the board.}
 
 We ask whether standard popularity-bias mitigations can lift a learned model above the
 popularity baselines, applying each symmetrically to both GNN backbones:
-popularity-debiased negative sampling (exponent $\alpha$), IPS / log-popularity
-re-ranking (penalty $\beta$), the logQ correction, DropEdge, a sinusoidal
-transfer-edge time encoding, and the stacked combinations Debias+IPS and Time+IPS. The
-gains are \textbf{partial and unstable} (Figure~\ref{fig:sweeps}).
+popularity-debiased negative sampling, IPS / log-popularity
+re-ranking, the logQ correction, DropEdge, a sinusoidal
+transfer-edge time encoding, and the stacked combinations Debias+IPS and Time+IPS.
+Concretely, popularity-debiased sampling draws hard negatives with probability
+$P(c)\propto \mathrm{pop}_c^{\alpha}$ (exponent $\alpha$; $\alpha{=}0$ recovers uniform
+same-IPC sampling); IPS / log-popularity re-ranking penalizes the inference score as
+$\tilde{s}(p,c)=s(p,c)-\beta\log(\mathrm{pop}_c+1)$ (penalty $\beta$); and the logQ
+correction subtracts the log negative-sampling probability from each candidate logit
+during training, $s(p,c)\leftarrow s(p,c)-\log Q(c)$, debiasing the sampled-softmax
+estimate. The gains are partial and unstable (Figure~\ref{fig:sweeps}).
 
 \begin{itemize}
 \item On GAT, two mitigations produce a small but statistically significant and
@@ -607,11 +635,11 @@ signed-rank Holm-adjusted $p=0.047$ --- yet both remain far below MostPop (0.197
 GraphSAGE+logQ reaches 0.125 but is \emph{not} significant after correction (high
 cross-seed variance, Holm-adjusted $p\approx1.0$).
 \item IPS re-ranking raises NDCG@10 the most --- GAT+IPS and GraphSAGE+Debias+IPS reach
-$\approx$0.157--0.158 --- but at the cost of driving \textbf{AUC to 0.417, below
-chance}: the penalty demotes popular candidates wholesale, helping the metric when the
+$\approx$0.157--0.158 --- but at the cost of driving AUC to 0.417, below
+chance: the penalty demotes popular candidates wholesale, helping the metric when the
 positive is unpopular and hurting global discrimination. The $\beta$-sweep shows
 NDCG@10 rising monotonically with the penalty (GAT $0.074\!\to\!0.157$) exactly as AUC
-falls, confirming the trade is mechanical rather than a genuine relevance gain.
+falls, confirming the trade-off is mechanical rather than a relevance gain.
 \item Popularity-debiased sampling ($\alpha$) is noisy and non-monotone, never reaching
 the baseline. DropEdge produces small, non-significant changes; the time encoding is
 significant on GAT (above) but not on GraphSAGE.
@@ -667,6 +695,16 @@ benchmarks; rolling-origin evaluation; content-aware company representations and
 cold-start-specific architectures; and treatment of the realized-transfer/latent-demand
 gap via exposure modeling.
 
+\paragraph{Generalizability.} The quantitative verdict --- the magnitude of the
+cold-start rate, the size of the popularity-baseline gap, and the temporal-vs-random
+reversal --- is specific to the KIPRIS transfer record and its company-size
+distribution, and we do not claim the same ordering reproduces on markets with
+different transfer density. What we expect to generalize is methodological: the
+protocol (temporal split, same-class hard negatives, cold-start accounting,
+average-rank tie-break), the bias and cold-start diagnostics, and the
+strict-tie-break artifact are dataset-agnostic and apply to any sampled-ranking
+evaluation of cold-start-heavy link prediction.
+
 %% ===========================================================================
 \section{Conclusion}
 \label{sec:conclusion}
@@ -691,20 +729,34 @@ artifact --- a strict tie-break inflates degenerate cold-start models to near-pe
 scores ($\approx$0.95--1.00), corrected to 0.037 and 0.125 by average-rank --- and show
 the diagnosis survives an unsampled full-pool metric. Finally, the protocol is
 decisive: under a random split the cold-start rate falls to 2.4\% and matrix
-factorization becomes the single best method (0.442, AUC 0.830), the exact reverse of
+factorization becomes the single best method (0.442, AUC 0.830), reversing
 the temporal verdict. Our aim has been not a winning model but an evaluation protocol
 and a diagnosis --- with reusable bias-diagnostic tools --- to discipline future work on
 patent technology-transfer prediction and on cold-start-heavy link prediction more
 broadly.
 
+\paragraph{Implications for research and practice.} For \emph{research},
+the results argue for reporting patent-recommendation and technology-transfer
+results under temporal splits with same-class hard negatives and explicit
+cold-start accounting, and for treating a popularity baseline and an AUC sanity
+check as mandatory reference points; near-perfect random-split numbers should be
+read as upper bounds, not as deployment estimates. For \emph{practice},
+technology-transfer intermediaries should not expect a learned ranker to
+outperform a simple popularity or recency heuristic on genuinely new patents
+under this market's data, and a popularity prior is a defensible, low-cost
+operational default; closing the gap will require content-aware company
+representations and exposure-aware supervision rather than a change of graph
+architecture alone.
+
 %% ===========================================================================
 \section*{Data availability}
-The KIPRIS patent data is obtained from the Korea Intellectual Property Rights
-Information Service API (\url{https://plus.kipris.or.kr}); access requires a free API
-key, and redistribution of the raw exports is subject to KIPRIS terms. We release the
-preprocessing and evaluation code, the experiment scripts, and a script to regenerate
-the frozen SBERT embeddings from patent text, enabling full reproduction of all tables
-and figures from the KIPRIS exports.
+The patent data were obtained from the Korea Intellectual Property Rights Information
+Service (KIPRIS) through its paid API (KIPRIS Plus, \url{https://plus.kipris.or.kr})
+and were subsequently cleaned and processed by the authors. The processed dataset can
+be made available upon reasonable request by email, subject to KIPRIS terms of use.
+The preprocessing and evaluation code, the experiment scripts, and a script to
+regenerate the frozen SBERT embeddings from patent text are released to enable full
+reproduction of all tables and figures from the KIPRIS exports.
 
 %% ===========================================================================
 \bibliographystyle{elsarticle-num}

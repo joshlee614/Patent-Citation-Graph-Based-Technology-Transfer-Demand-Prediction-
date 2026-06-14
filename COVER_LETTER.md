@@ -1,6 +1,6 @@
 Dear Editor-in-Chief,
 
-We submit our manuscript entitled "When Learned Models Lose to Popularity: A Diagnosis of Patent Technology-Transfer Demand Prediction under Realistic Evaluation" for consideration for publication in *Information Processing & Management*.
+We submit our manuscript entitled "Popularity Bias and Cold-Start in Patent Technology-Transfer Demand Prediction: A Diagnostic Evaluation of Graph- and Content-Based Link Prediction on KIPRIS" for consideration for publication in *Information Processing & Management*.
 
 Patent technology-transfer demand prediction — given a patent, ranking which companies are plausible recipients of its rights — is increasingly framed as link prediction or recommendation over patent–citation–transfer graphs, and recent graph-based systems report near-perfect retrieval (Recall@5 up to 0.998). These results, however, are obtained under random data splits with uniformly sampled negatives, evaluation choices that the information-retrieval and recommendation literature has repeatedly shown to be optimistic. Whether learned models genuinely recover transfer-demand signal under a realistic, leakage-free protocol — rather than reproducing the historical popularity of frequent acquirers — has not been established. This is the open question our manuscript addresses.
 
