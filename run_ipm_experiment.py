@@ -859,6 +859,14 @@ def main():
     parser.add_argument("--split", type=str, default="temporal", choices=["temporal", "random"],
                         help="temporal = chronological 70/15/15 by trRegistrationDate (realistic). "
                              "random = shuffled 70/15/15 (the leaky baseline used to show inflation, RQ1).")
+    parser.add_argument("--rolling_fold", type=int, default=None,
+                        help="Rolling-origin (forward-chaining) evaluation: run one temporal fold k "
+                             "(0..rolling_nfolds-1). Fold k tests on [0.70+0.10k, 0.80+0.10k) with an "
+                             "expanding training window, showing the diagnosis is stable across cutoffs "
+                             "rather than an artifact of a single split. Use a separate --artifact_dir per fold.")
+    parser.add_argument("--rolling_nfolds", type=int, default=3,
+                        help="Number of rolling-origin folds (default 3). Only documents intent; each "
+                             "fold is launched separately via --rolling_fold.")
     parser.add_argument("--company_feat", type=str, default="random", choices=["random", "content"],
                         help="GNN/MLP company node features. 'random' = fixed random (default). "
                              "'content' = mean frozen-SBERT of the patents the company received in TRAIN "
@@ -909,7 +917,8 @@ def main():
         return {"mode": args.mode, "split": args.split, "n_neg": n_neg, "num_seeds": num_seeds,
                 "max_epochs": max_epochs, "company_feat": args.company_feat,
                 "full_pool": bool(args.full_pool), "full_pool_cap": args.full_pool_cap,
-                "demand_sample": args.demand_sample, "data_dir": args.data_dir, "emb_path": args.emb_path}
+                "demand_sample": args.demand_sample, "data_dir": args.data_dir, "emb_path": args.emb_path,
+                "rolling_fold": args.rolling_fold}
     _ckpt = None
     if os.path.exists(RESUME_PATH) and not args.fresh_start:
         try:
@@ -1006,11 +1015,30 @@ def main():
         print("Split: TEMPORAL (chronological 70/15/15 by trRegistrationDate).")
     
     n_transfers = len(transfers_df)
-    train_end = int(n_transfers * 0.70)
-    val_end = int(n_transfers * 0.85)
-    train_df = transfers_df.iloc[:train_end]
-    val_df = transfers_df.iloc[train_end:val_end]
-    test_df = transfers_df.iloc[val_end:]
+    if args.rolling_fold is not None and args.split == "temporal":
+        # Rolling-origin (forward-chaining): expanding training window with a sliding
+        # 10% test window. Fold k tests on [0.70+0.10k, 0.80+0.10k), trains on everything
+        # before a 5% validation slice. Shows the diagnosis is stable across cutoffs.
+        k = args.rolling_fold
+        test_start_f = 0.70 + 0.10 * k
+        test_end_f = min(1.0, 0.80 + 0.10 * k)
+        train_end_f = test_start_f - 0.05
+        train_end = int(n_transfers * train_end_f)
+        val_end = int(n_transfers * test_start_f)
+        test_end = int(n_transfers * test_end_f)
+        train_df = transfers_df.iloc[:train_end]
+        val_df = transfers_df.iloc[train_end:val_end]
+        test_df = transfers_df.iloc[val_end:test_end]
+        print(f"Split: ROLLING-ORIGIN fold {k} (of {args.rolling_nfolds}): "
+              f"train[0,{train_end_f:.2f}) val[{train_end_f:.2f},{test_start_f:.2f}) "
+              f"test[{test_start_f:.2f},{test_end_f:.2f}); "
+              f"{len(train_df)}/{len(val_df)}/{len(test_df)} transfers.", flush=True)
+    else:
+        train_end = int(n_transfers * 0.70)
+        val_end = int(n_transfers * 0.85)
+        train_df = transfers_df.iloc[:train_end]
+        val_df = transfers_df.iloc[train_end:val_end]
+        test_df = transfers_df.iloc[val_end:]
     
     # IPC lists
     patents_df['ipc4'] = patents_df['patIpcNumber'].astype(str).str[:4]
