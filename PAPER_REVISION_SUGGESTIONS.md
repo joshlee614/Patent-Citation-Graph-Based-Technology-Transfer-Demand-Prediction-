@@ -204,6 +204,12 @@ Table 2 캡션: *"…These changes are definitional; their measured effect on ra
 **수정 제안:** "DropEdge on citation edges has **no material effect**: GAT+DropEdge (0.071/0.516) is indistinguishable from GAT (0.072/0.516). We do not claim DropEdge as a contributing mechanism."
 **근거:** 실측 거의 동일. 제목/초록의 "with DropEdge" 프레이밍과 충돌.
 
+### 7.5 §5.6 Reproducibility — 하드웨어/런타임 명시 (신규)
+**기존:** §5.6에 코드·데이터 가용성은 있으나 **하드웨어·런타임(Colab T4) 미기재**.
+**수정 제안 (§5.6에 한 단락 추가):**
+> "All experiments were run on a single NVIDIA Tesla T4 GPU (Google Colab Free), using PyTorch and PyTorch Geometric. Under the temporal protocol (n_neg = 100), the full ten-seed run over the 23 model configurations completes in approximately 70 minutes of wall-clock time, with a per-seed cost of roughly 330–360 s; the seed-invariant rule-based Demand Score (evaluated on a 200-query sample because of its per-query citation breadth-first search) and the candidate-set-size sensitivity sweep add a one-time overhead of a few minutes. The compute device is auto-selected in the order CUDA → MPS → CPU and can be overridden; we note that CPU runs are substantially slower and that Apple-MPS does not support the sparse operations used by the LightGCN/NGCF baselines, so a CUDA GPU is the intended environment. Random seeds (torch and numpy) are fixed per run for reproducibility."
+**근거:** `torch.cuda.get_device_name(0)` = "Tesla T4"; 측정 per-seed ~330–365s, 10-seed ~70분(데이터 로드+후보생성+학습+진단 포함). device 자동선택 cuda→mps→cpu (`--device`로 오버라이드 가능). MPS sparse 미지원으로 GPU(CUDA) 필요. (Table 3 하단 또는 §5.6 본문에 삽입; 정확한 GPU 시간/메모리는 최종 run 로그로 확정 권장 `[확인 필요]`.)
+
 ---
 
 ## 8. §6 Results — 실측치로 교체
