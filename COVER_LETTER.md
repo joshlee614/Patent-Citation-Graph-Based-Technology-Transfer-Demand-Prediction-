@@ -29,7 +29,12 @@ We confirm that this manuscript has not been published elsewhere and is not unde
 Thank you for your time and consideration.
 
 Sincerely,
-[[Corresponding Author Name]] (Corresponding Author)
-[[Department, Institution]]
-[[Street address, City, Postcode]], Republic of Korea
-[[corresponding.author@institution.edu]]
+On behalf of all authors,
+
+Kyungseok Lee (Corresponding Author)
+School of Mechanical Engineering, Hanyang University, Seoul 04763, Republic of Korea
+bu5119@hanyang.ac.kr
+
+Dongkyu Lee (Corresponding Author)
+Quantum AI Task, LG AI Lab, CTO Division, LG Electronics Co., Ltd.,
+19 Yangjae-daero 11-gil, Seocho-gu, Seoul 06772, Republic of Korea
