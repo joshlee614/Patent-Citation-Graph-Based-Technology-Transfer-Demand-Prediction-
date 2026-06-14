@@ -825,6 +825,11 @@ def main():
     parser.add_argument("--split", type=str, default="temporal", choices=["temporal", "random"],
                         help="temporal = chronological 70/15/15 by trRegistrationDate (realistic). "
                              "random = shuffled 70/15/15 (the leaky baseline used to show inflation, RQ1).")
+    parser.add_argument("--company_feat", type=str, default="random", choices=["random", "content"],
+                        help="GNN/MLP company node features. 'random' = fixed random (default). "
+                             "'content' = mean frozen-SBERT of the patents the company received in TRAIN "
+                             "(leakage-free; cold companies fall back to random). Tests whether content "
+                             "company representations let GNNs beat the popularity baseline.")
     parser.add_argument("--nneg_sweep", action="store_true",
                         help="After the run, sweep candidate-set size n_neg in {50,100,200} for key models "
                              "(MostPop, SVD, GraphSAGE, GAT) and report NDCG@10 vs n_neg (sampled-metric defense).")
@@ -1091,7 +1096,22 @@ def main():
     # Set up PyG HeteroData structure
     data = HeteroData()
     data['patent'].x = patent_x.to(device)
-    company_x = torch.randn(NUM_COMPANIES, 64) * 0.1 # Corrected: company dimension is d=64
+    if args.company_feat == "content":
+        # Leakage-free content features: mean frozen-SBERT of the company's TRAIN-received patents.
+        COMPANY_IN = patent_x.size(1)  # 384
+        company_x = torch.randn(NUM_COMPANIES, COMPANY_IN) * 0.1  # fallback for cold (no train transfer) companies
+        n_content = 0
+        for c, pats in company_patents.items():
+            if pats:
+                idx = torch.tensor(sorted(pats), dtype=torch.long)
+                company_x[c] = patent_x[idx].mean(0)
+                n_content += 1
+        print(f"Company features: CONTENT (mean train-patent SBERT) for {n_content}/{NUM_COMPANIES} companies; "
+              f"cold companies use random fallback.", flush=True)
+    else:
+        COMPANY_IN = 64
+        company_x = torch.randn(NUM_COMPANIES, COMPANY_IN) * 0.1
+        print("Company features: RANDOM (fixed).", flush=True)
     data['company'].x = company_x.to(device)
     
     c_indices = [company2idx[c] for c in train_df['trCorrelatorName']]
@@ -1277,7 +1297,7 @@ def main():
         record_model("SVD", ranks_svd, aucs_svd, aps_svd, scores_svd, pop_svd)
         
         # 4. MLP Baseline
-        mlp = FullModel('MLP', 384, 64).to(device)
+        mlp = FullModel('MLP', 384, COMPANY_IN).to(device)
         train_gnn(mlp, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
         ranks_mlp, aucs_mlp, aps_mlp, scores_mlp, pop_mlp = evaluate_mlp(mlp, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
         record_model("MLP", ranks_mlp, aucs_mlp, aps_mlp, scores_mlp, pop_mlp)
@@ -1295,13 +1315,13 @@ def main():
         record_model("NGCF", ranks_ngcf, aucs_ngcf, aps_ngcf, scores_ngcf, pop_ngcf)
         
         # 7. GraphSAGE
-        sage = FullModel('SAGE', 384, 64).to(device)
+        sage = FullModel('SAGE', 384, COMPANY_IN).to(device)
         train_gnn(sage, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
         ranks_sage, aucs_sage, aps_sage, scores_sage, pop_sage = evaluate_gnn(sage, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
         record_model("GraphSAGE", ranks_sage, aucs_sage, aps_sage, scores_sage, pop_sage)
             
         # 8. GAT
-        gat = FullModel('GAT', 384, 64).to(device)
+        gat = FullModel('GAT', 384, COMPANY_IN).to(device)
         train_gnn(gat, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
         ranks_gat, aucs_gat, aps_gat, scores_gat, pop_gat = evaluate_gnn(gat, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
         record_model("GAT", ranks_gat, aucs_gat, aps_gat, scores_gat, pop_gat)
@@ -1368,22 +1388,22 @@ def main():
             base_model = base_trained[disp]
 
             # Debias (retrain with popularity-debiased negatives)
-            m_db = FullModel(gtype, 384, 64).to(device)
+            m_db = FullModel(gtype, 384, COMPANY_IN).to(device)
             train_gnn(m_db, data, train_edge_index, train_pop, debias_alpha=0.75, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
             record_model(f"{disp}+Debias", *evaluate_gnn(m_db, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0))
 
             # logQ (retrain with sampled-softmax / logQ correction)  — B6
-            m_lq = FullModel(gtype, 384, 64).to(device)
+            m_lq = FullModel(gtype, 384, COMPANY_IN).to(device)
             train_gnn(m_lq, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=1.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
             record_model(f"{disp}+logQ", *evaluate_gnn(m_lq, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0))
 
             # DropEdge (retrain with citation-edge dropout)
-            m_de = FullModel(gtype, 384, 64, apply_dropedge=True).to(device)
+            m_de = FullModel(gtype, 384, COMPANY_IN, apply_dropedge=True).to(device)
             train_gnn(m_de, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
             record_model(f"{disp}+DropEdge", *evaluate_gnn(m_de, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0))
 
             # Time (retrain with sinusoidal time encoding threaded through train_gnn)
-            m_t = FullModel(gtype, 384, 64, use_time=True).to(device)
+            m_t = FullModel(gtype, 384, COMPANY_IN, use_time=True).to(device)
             train_gnn(m_t, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5, time_enc=time_enc)
             record_model(f"{disp}+Time", *evaluate_gnn(m_t, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0, time_enc=time_enc))
 
@@ -1407,7 +1427,7 @@ def main():
                 beta_ndcg_seeds[(disp, beta)].append(aggregate(ranks_b)["ndcg@10"])
             # Debias alpha sweep (retrain per alpha)
             for alpha in alphas:
-                m_tmp = FullModel(gtype, 384, 64).to(device)
+                m_tmp = FullModel(gtype, 384, COMPANY_IN).to(device)
                 train_gnn(m_tmp, data, train_edge_index, train_pop, debias_alpha=alpha, logq_alpha=0.0, max_epochs=max_epochs, lr=0.01, device=device, seed=seed, num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
                 ranks_a, *_ = evaluate_gnn(m_tmp, data, test_p_t, test_cand_t, device, train_pop_t, ips_beta=0.0)
                 alpha_ndcg_seeds[(disp, alpha)].append(aggregate(ranks_a)["ndcg@10"])
@@ -1733,6 +1753,7 @@ def main():
     md_content = f"""# IPM Experiment Evaluation & Diagnostics Report
 
 - **Run Mode**: {args.mode} (Seeds: {len(SEEDS)}, Epochs: {max_epochs}, Candidates: {n_neg})
+- **Split**: {args.split} | **Company features**: {args.company_feat}
 - **Device**: {device}
 - **Average Candidate Padding Rate**: {avg_padding_rate:.2%}
 - **Cold-Start Statistics (Test Set)**:

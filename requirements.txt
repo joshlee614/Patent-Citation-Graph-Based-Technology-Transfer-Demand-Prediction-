@@ -1,0 +1,23 @@
+# Python dependencies for run_ipm_experiment.py
+# Tested locally on Python 3.9 and on Google Colab (Python 3.x, CUDA T4).
+#
+# NOTE for Google Colab: torch is PRE-INSTALLED (CUDA build). Install only the two
+# extra packages:   !pip install -q torch_geometric statsmodels
+# Installing a pinned torch on Colab can break the CUDA build — do not.
+#
+# Local / from-scratch install: pip install -r requirements.txt
+# (for CUDA, install the matching torch wheel from https://pytorch.org first).
+
+torch>=2.0,<3.0
+torch_geometric>=2.5
+numpy>=1.24,<2.0
+scipy>=1.10
+scikit-learn>=1.3
+pandas>=2.0
+statsmodels>=0.14
+matplotlib>=3.7
+
+# Only needed to (re)generate patent_embeddings.pt from patent text
+# (train_gnn_full_scale.py); not required to run the main experiment if you
+# already have patent_embeddings.pt:
+sentence-transformers>=2.2
