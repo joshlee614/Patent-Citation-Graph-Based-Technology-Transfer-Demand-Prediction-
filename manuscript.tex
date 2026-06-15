@@ -710,6 +710,40 @@ SVD         & 0.047 & 0.060 & 0.042 \\
 \end{tabular}
 \end{table}
 
+\subsection{Architecture and hyperparameter sensitivity}
+\label{sec:arch}
+A further objection is that the GNNs fail only because they are under-sized or
+under-tuned. We therefore retrain GraphSAGE and GAT over a grid of embedding dimension
+(hidden/output size in $\{16/8,\,32/16,\,64/32,\,128/64\}$) and learning rate
+($\{0.005, 0.01, 0.02\}$) --- 24 configurations in total
+(Table~\ref{tab:arch}). The best configuration reaches NDCG@10 = 0.150 (GraphSAGE), and
+GAT peaks at 0.110; both remain far below the MostPop baseline of 0.197, and most
+configurations are lower still. No reasonable architecture or learning-rate setting
+lifts a GNN to the popularity skyline, so the diagnosis is not an artifact of an
+under-capacity or under-tuned model.
+
+\begin{table}[t]
+\centering
+\caption{GNN architecture / hyperparameter sensitivity (temporal, NDCG@10, seed 0).
+GraphSAGE and GAT retrained over embedding dimension (hidden/output) and learning rate.
+The best of 24 configurations (0.150) remains below the MostPop baseline (0.197).}
+\label{tab:arch}
+\begin{tabular}{llccc}
+\toprule
+Backbone & hidden/out & $\eta=0.005$ & $\eta=0.01$ & $\eta=0.02$ \\
+\midrule
+GraphSAGE & 16/8   & 0.038 & 0.050 & 0.149 \\
+GraphSAGE & 32/16  & 0.109 & 0.070 & 0.037 \\
+GraphSAGE & 64/32  & 0.042 & 0.047 & 0.150 \\
+GraphSAGE & 128/64 & 0.048 & 0.055 & 0.047 \\
+GAT       & 16/8   & 0.074 & 0.084 & 0.086 \\
+GAT       & 32/16  & 0.077 & 0.070 & 0.086 \\
+GAT       & 64/32  & 0.080 & 0.094 & 0.108 \\
+GAT       & 128/64 & 0.079 & 0.106 & 0.110 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 %% ===========================================================================
 \section{Mitigations (RQ3)}
 \label{sec:mitigation}
