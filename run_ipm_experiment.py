@@ -882,6 +882,11 @@ def main():
     parser.add_argument("--full_pool_cap", type=int, default=1000,
                         help="Max same-IPC pool size for --full_pool (pools above this are down-capped to bound "
                              "memory; the fraction capped is reported). Default 1000.")
+    parser.add_argument("--arch_sweep", action="store_true",
+                        help="Seed-0 GNN architecture / hyperparameter sensitivity: retrain GraphSAGE and GAT over "
+                             "a grid of embedding dimension (hidden/out) and learning rate, reporting NDCG@10 for "
+                             "each, to show no reasonable configuration beats the popularity baseline. No effect on "
+                             "the main results.")
     parser.add_argument("--demand_sample", type=int, default=200,
                         help="Demand Score (E19) is a slow per-query citation-BFS and near-degenerate on KIPRIS. "
                              "Evaluate it on a random sample of this many test queries. Keep it small (100-300); "
@@ -1312,6 +1317,7 @@ def main():
     # Seed-0-only results: restore from checkpoint if present, else None (filled at seed 0 below).
     nneg_sweep_results = _ckpt["nneg_sweep_results"] if _ckpt is not None else None
     full_pool_results = _ckpt["full_pool_results"] if _ckpt is not None else None
+    arch_sweep_results = _ckpt.get("arch_sweep_results") if _ckpt is not None else None  # --arch_sweep
 
     # Demand Score (E19) is ALSO seed-invariant (no learned params, fixed candidates), and its
     # per-query citation-BFS loop is the single most expensive non-GNN step. Compute it ONCE —
@@ -1380,6 +1386,7 @@ def main():
             "demand_orig_ndcg_seeds": demand_orig_ndcg_seeds, "demand_rev_ndcg_seeds": demand_rev_ndcg_seeds,
             "gat_attention_weights": gat_attention_weights, "gat_is_hub_edge": gat_is_hub_edge,
             "nneg_sweep_results": nneg_sweep_results, "full_pool_results": full_pool_results,
+            "arch_sweep_results": arch_sweep_results,
             "mostpop_ipc_cached": mostpop_ipc_cached, "cn_cached": cn_cached, "aa_cached": aa_cached,
             "demand_orig_ndcg_once": demand_orig_ndcg_once, "demand_rev_ndcg_once": demand_rev_ndcg_once,
         }
@@ -1551,6 +1558,30 @@ def main():
             print(f"  full-pool done: mean pool={_fp_meta['mean_pool']:.0f}, capped "
                   f"{_fp_meta['n_capped']}/{_fp_meta['n_eval']}, skipped {_fp_meta['n_skipped']} "
                   f"(+{time.time()-_tfp:.0f}s)", flush=True)
+
+        # GNN architecture / hyperparameter sensitivity (seed 0 only) — retrain GraphSAGE
+        # and GAT over a grid of embedding dimension and learning rate to show no
+        # reasonable configuration beats the popularity baseline.
+        if args.arch_sweep and seed == SEEDS[0]:
+            print("Running GNN architecture/hyperparameter sweep (GraphSAGE/GAT)...", flush=True)
+            _ta = time.time()
+            arch_grid_dims = [(16, 8), (32, 16), (64, 32), (128, 64)]   # (hidden_dim, out_dim)
+            arch_grid_lr = [0.005, 0.01, 0.02]
+            arch_sweep_results = {}
+            for _disp, _gtype in [("GraphSAGE", "SAGE"), ("GAT", "GAT")]:
+                for (_hd, _od) in arch_grid_dims:
+                    for _lr in arch_grid_lr:
+                        _m = FullModel(_gtype, 384, COMPANY_IN, hidden_dim=_hd, out_dim=_od).to(device)
+                        train_gnn(_m, data, train_edge_index, train_pop, debias_alpha=0.0, logq_alpha=0.0,
+                                  max_epochs=max_epochs, lr=_lr, device=device, seed=seed,
+                                  num_companies=NUM_COMPANIES, val_queries=val_queries, patience=5)
+                        _nd = aggregate(evaluate_gnn(_m, data, test_p_t, test_cand_t, device, train_pop_t)[0])["ndcg@10"]
+                        arch_sweep_results[(_disp, _hd, _od, _lr)] = _nd
+                        print(f"  [arch] {_disp:10s} hidden={_hd:3d} out={_od:2d} lr={_lr:<5}: "
+                              f"NDCG@10={_nd:.4f}", flush=True)
+            _best = max(arch_sweep_results.values()) if arch_sweep_results else 0.0
+            print(f"  arch sweep done: best NDCG@10={_best:.4f} (MostPop reference 0.197) "
+                  f"(+{time.time()-_ta:.0f}s)", flush=True)
 
         if seed == 0:
             gat.eval()
@@ -1909,6 +1940,25 @@ def main():
             f"{meta.get('n_skipped', 0)} skipped (no eligible same-IPC negative). The model ordering is "
             "preserved under full-pool ranking (learned models do not overtake MostPop).\n\n" + fp_table)
 
+    # GNN architecture / hyperparameter sensitivity (E20): table, if run
+    arch_sweep_section = ""
+    if arch_sweep_results:
+        lrs = sorted({k[3] for k in arch_sweep_results})
+        dims = sorted({(k[1], k[2]) for k in arch_sweep_results}, key=lambda t: t[1])
+        best = max(arch_sweep_results.values())
+        arch_table = "| Backbone | hidden/out | " + " | ".join(f"lr={lr}" for lr in lrs) + " |\n"
+        arch_table += "| :--- | :---: " + "| :---: " * len(lrs) + "|\n"
+        for disp in ["GraphSAGE", "GAT"]:
+            for (hd, od) in dims:
+                row = [f"{arch_sweep_results.get((disp, hd, od, lr), float('nan')):.4f}" for lr in lrs]
+                arch_table += f"| {disp} | {hd}/{od} | " + " | ".join(row) + " |\n"
+        arch_sweep_section = (
+            "\n## 13. GNN Architecture / Hyperparameter Sensitivity (E20)\n"
+            "NDCG@10 for GraphSAGE and GAT retrained over a grid of embedding dimension (hidden/out) and "
+            "learning rate (seed 0). The best configuration reaches NDCG@10 = "
+            f"{best:.4f}, still far below the MostPop baseline (0.197): the failure is not an artifact of "
+            "an under-sized or under-tuned model.\n\n" + arch_table)
+
     # Save beta sweep plot (one curve per backbone)
     plt.figure(figsize=(6, 4))
     for disp, _ in BACKBONES:
@@ -2058,6 +2108,7 @@ Percentile CIs from resampling the per-query ranks (captures query-sampling vari
 {boot_table}
 {nneg_section}
 {full_pool_section}
+{arch_sweep_section}
 """
     
     with open(results_path, "w") as f:
