@@ -587,7 +587,7 @@ representations are degenerate --- the tie-break rule determines the metric. Und
 strict greater-than rule the positive is placed ahead of every tied candidate \emph{by
 construction}: because 91.7\% of test patents are cold and a fully-degenerate model
 assigns every candidate the same score, such a model is ranked first on essentially
-every cold query and appears near-perfect. In an earlier strict-rule evaluation this
+every cold query and appears near-perfect. Under the strict-rule variant of our own protocol, this
 inflated SVD (whose latent factor for an unseen patent is zero, leaving all candidates
 tied) to NDCG@10 $\approx$ 0.95, and a fully-tied GraphSAGE+logQ to 1.00 by
 construction. Replacing the strict rule with an \emph{average-rank} tie-break (a tie
@@ -870,8 +870,12 @@ relative to the transfer-edge leakage we control.
 \paragraph{External validity.} All experiments use the Korean KIPRIS corpus. The
 popularity-bias and cold-start regime are properties of this market's transfer record;
 we cannot claim the same collapse would reproduce on a market with a different transfer
-density or company-size distribution. The diagnosis is established for one jurisdiction
-and is a hypothesis elsewhere.
+density or company-size distribution, and the quantitative verdict is established for
+one jurisdiction and is a hypothesis elsewhere. What we expect to generalize is instead
+methodological: the protocol (temporal split, same-class hard negatives, cold-start
+accounting, average-rank tie-break), the bias and cold-start diagnostics, and the
+strict-tie-break artifact are dataset-agnostic and apply to any sampled-ranking
+evaluation of cold-start-heavy link prediction.
 
 \paragraph{Statistical-conclusion validity.} Ten seeds with Wilcoxon signed-rank +
 Holm--Bonferroni and bootstrap CIs over queries; we report effect sizes alongside
@@ -888,19 +892,9 @@ popularity baselines at any cutoff, and with the controlled random-split contras
 failure. A finer-grained or longer rolling horizon remains possible future work.
 
 \paragraph{Future work.} Replication on USPTO/EPO records and public link-prediction
-benchmarks; rolling-origin evaluation; content-aware company representations and
-cold-start-specific architectures; and treatment of the realized-transfer/latent-demand
-gap via exposure modeling.
-
-\paragraph{Generalizability.} The quantitative verdict --- the magnitude of the
-cold-start rate, the size of the popularity-baseline gap, and the temporal-vs-random
-reversal --- is specific to the KIPRIS transfer record and its company-size
-distribution, and we do not claim the same ordering reproduces on markets with
-different transfer density. What we expect to generalize is methodological: the
-protocol (temporal split, same-class hard negatives, cold-start accounting,
-average-rank tie-break), the bias and cold-start diagnostics, and the
-strict-tie-break artifact are dataset-agnostic and apply to any sampled-ranking
-evaluation of cold-start-heavy link prediction.
+benchmarks; content-aware company representations and cold-start-specific
+architectures; a formal temporal graph model; and treatment of the
+realized-transfer/latent-demand gap via exposure modeling.
 
 %% ===========================================================================
 \section{Conclusion}
@@ -917,8 +911,9 @@ are not learned: MostPop-IPC (0.199), MostPop (0.197), and a popularity-equivale
 (0.196); the strongest learned model, a text MLP, reaches only 0.150, and every
 graph-based model is lower (GraphSAGE+logQ 0.125, GAT+logQ 0.107), with AUC near chance
 (0.42--0.60). Two compounding causes account for this: popularity bias (98.8\% of
-GraphSAGE and 57.8\% of GAT errors are losses to a more-popular hard negative; $\rho$ up
-to 1.0) and extreme patent cold-start (91.7\% unseen; SVD 0.000 on new patents). The
+GraphSAGE and 57.8\% of GAT errors are losses to a more-popular hard negative;
+score--popularity $\rho$ up to 1.0 for a popularity counter) and extreme patent
+cold-start (91.7\% unseen; SVD 0.000 on new patents). The
 mitigations we evaluate yield only partial, unstable gains: logQ significantly improves
 GAT ($0.074\!\to\!0.107$) yet stays below MostPop, and IPS re-ranking raises NDCG@10 to
 $\approx$0.157 only by driving AUC to 0.417. We additionally document an evaluation
